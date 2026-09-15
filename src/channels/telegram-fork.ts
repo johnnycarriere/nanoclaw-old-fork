@@ -50,31 +50,27 @@ async function sendWebAppButton(
   url: string,
 ): Promise<string | undefined> {
   const chatId = platformId.split(':').slice(1).join(':');
-  if (!chatId) return undefined;
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        reply_markup: {
-          keyboard: [[{ text: label, web_app: { url } }]],
-          resize_keyboard: true,
-          one_time_keyboard: true,
-        },
-      }),
-    });
-    const json = (await res.json()) as { ok: boolean; result?: { message_id?: number } };
-    if (!json.ok) {
-      log.warn('Telegram web_app button send non-OK', { status: res.status });
-      return undefined;
-    }
-    return json.result?.message_id != null ? String(json.result.message_id) : undefined;
-  } catch (err) {
-    log.error('Telegram web_app button send failed', { err });
-    return undefined;
+  if (!chatId) throw new Error('Telegram web_app button requires a chat id');
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      reply_markup: {
+        keyboard: [[{ text: label, web_app: { url } }]],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    }),
+  });
+  const json = (await res.json()) as { ok: boolean; result?: { message_id?: number } };
+  if (!res.ok || !json.ok || json.result?.message_id == null) {
+    // Throw so the host retains the outbound row and retries delivery.
+    // Do not include the URL (it contains the bot token) in the error.
+    throw new Error(`Telegram web_app button send failed (HTTP ${res.status})`);
   }
+  return String(json.result.message_id);
 }
 
 /** A `send_card` payload whose actions carry a `webAppUrl`, or null. */
