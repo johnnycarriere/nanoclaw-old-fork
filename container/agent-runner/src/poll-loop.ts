@@ -1,6 +1,7 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
+  getMessageIn,
   markProcessing,
   markCompleted,
   markScriptSkipped,
@@ -29,13 +30,7 @@ import {
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
-import type {
-  AgentProvider,
-  AgentQuery,
-  ContentBlock,
-  ProviderEvent,
-  ProviderExchange,
-} from './providers/types.js';
+import type { AgentProvider, AgentQuery, ContentBlock, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -291,13 +286,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        in_reply_to: routing.inReplyTo,
+        content: providerErrorContent(`Error: ${errMsg}`, routing.inReplyTo),
       });
 
-      // The batch is still acked completed below (no redelivery). Without
+      // The batch is still acked completed below (no immediate redelivery). Without
       // this line the only log trace of the errored turn is "Query error"
       // followed by a "Completed" line that reads like success.
-      log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
+      log(
+        `Errored batch will be acked completed — ${processingIds.length} message(s); host may retry transient failures`,
+      );
     } finally {
       clearCurrentInReplyTo();
       config.signal?.removeEventListener('abort', abortActiveQuery);
@@ -360,7 +358,10 @@ function formatMessagesWithCommands(
  * images need to ride alongside the text. Ordering puts text first so
  * the model has the surrounding chat context before any image.
  */
-function toProviderPrompt(formatted: { text: string; images: { mediaType: string; data: string }[] }): string | ContentBlock[] {
+function toProviderPrompt(formatted: {
+  text: string;
+  images: { mediaType: string; data: string }[];
+}): string | ContentBlock[] {
   if (formatted.images.length === 0) return formatted.text;
   const blocks: ContentBlock[] = [{ type: 'text', text: formatted.text }];
   for (const img of formatted.images) {
@@ -748,13 +749,16 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
   }
 }
 
-/**
- * Deliver a turn's text straight to the channel the batch arrived on. Used when
- * a turn ends in a provider error (e.g. a non-retryable 403 billing_error) with
- * no <message> envelope: the notice would otherwise be dropped as scratchpad.
- * This is the same user-facing write the outer catch block does, minus the
- * `Error:` prefix — the provider's text is already a user-facing message.
- */
+/** Only runner error paths attach retry evidence; normal replies remain plain text. */
+export function providerErrorContent(text: string, inReplyTo: string | null): string {
+  const message = inReplyTo ? getMessageIn(inReplyTo) : undefined;
+  return JSON.stringify({
+    text,
+    ...(message ? { providerError: { source: 'runner', attempt: message.tries } } : {}),
+  });
+}
+
+/** Deliver an unwrapped provider error to the triggering channel. */
 async function deliverErrorResult(text: string, routing: RoutingContext): Promise<void> {
   log('Error result with no <message> envelope — delivering to channel');
   await writeMessageOut({
@@ -764,7 +768,7 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
     platform_id: routing.platformId,
     channel_type: routing.channelType,
     thread_id: routing.threadId,
-    content: JSON.stringify({ text: stripHarnessTagArtifacts(text) }),
+    content: providerErrorContent(stripHarnessTagArtifacts(text), routing.inReplyTo),
   });
 }
 

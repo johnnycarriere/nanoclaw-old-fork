@@ -220,7 +220,13 @@ describe('origin metadata (from= attribute)', () => {
       .run(name, name, channelType, platformId);
   }
 
-  function insertWithRouting(id: string, kind: string, content: object, channelType: string | null, platformId: string | null): void {
+  function insertWithRouting(
+    id: string,
+    kind: string,
+    content: object,
+    channelType: string | null,
+    platformId: string | null,
+  ): void {
     getInboundDb()
       .prepare(
         `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, content)
@@ -443,6 +449,17 @@ it('does not push accumulated-only follow-ups into an active query', async () =>
 });
 
 describe('error result with no <message> envelope', () => {
+  it('tags an actual provider failure with its originating attempt', async () => {
+    insertMessage('m1', 'chat', { text: 'hello' });
+    getInboundDb().prepare("UPDATE messages_in SET tries = 2 WHERE id = 'm1'").run();
+    const { query } = makeResultQuery({ type: 'result', text: 'Error: ECONNRESET', isError: true });
+    await processQuery(query, { ...ERR_ROUTING, inReplyTo: 'm1' }, ['m1'], 'claude');
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].in_reply_to).toBe('m1');
+    expect(JSON.parse(out[0].content).providerError).toEqual({ source: 'runner', attempt: 2 });
+  });
+
   it('delivers a budget/billing error to the triggering channel and does not nudge', async () => {
     const budgetText = 'Spending limit reached. Add your own key at https://example.com/keys';
     const { query, pushes } = makeResultQuery({ type: 'result', text: budgetText, isError: true });
@@ -484,9 +501,9 @@ const TASK_ROUTING = {
 
 function taskLogRows(): Array<{ text: string }> {
   return (
-    getOutboundDb()
-      .prepare("SELECT content FROM messages_out WHERE kind = 'task_log' ORDER BY seq")
-      .all() as Array<{ content: string }>
+    getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log' ORDER BY seq").all() as Array<{
+      content: string;
+    }>
   ).map((r) => JSON.parse(r.content) as { text: string });
 }
 
