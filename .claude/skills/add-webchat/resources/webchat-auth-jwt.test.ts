@@ -14,11 +14,7 @@ function base64UrlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString('base64url');
 }
 
-function signRs256Jwt(
-  payload: Record<string, unknown>,
-  privateKey: crypto.KeyObject,
-  kid = 'test-key',
-): string {
+function signRs256Jwt(payload: Record<string, unknown>, privateKey: crypto.KeyObject, kid = 'test-key'): string {
   const header = { alg: 'RS256', typ: 'JWT', kid };
   const encodedHeader = base64UrlJson(header);
   const encodedPayload = base64UrlJson(payload);
@@ -32,16 +28,13 @@ function rsaJwkFromPublicKey(publicKey: crypto.KeyObject, kid: string): JsonWebK
   return { ...jwk, kid, use: 'sig', alg: 'RS256' };
 }
 
-function signEs256Jwt(
-  payload: Record<string, unknown>,
-  privateKey: crypto.KeyObject,
-  kid = 'ec-key',
-): string {
+function signEs256Jwt(payload: Record<string, unknown>, privateKey: crypto.KeyObject, kid = 'ec-key'): string {
   const header = { alg: 'ES256', typ: 'JWT', kid };
   const encodedHeader = base64UrlJson(header);
   const encodedPayload = base64UrlJson(payload);
   const signingInput = `${encodedHeader}.${encodedPayload}`;
-  const signature = crypto.sign('sha256', Buffer.from(signingInput), privateKey);
+  // JWS requires the raw R||S (IEEE P1363) encoding, not DER.
+  const signature = crypto.sign('sha256', Buffer.from(signingInput), { key: privateKey, dsaEncoding: 'ieee-p1363' });
   return `${signingInput}.${signature.toString('base64url')}`;
 }
 
@@ -153,6 +146,29 @@ describe('webchat-auth-jwt', () => {
       nowSeconds: now,
     });
     expect(claims.sub).toBe('user-ec');
+  });
+
+  it('rejects DER-encoded ES256 signatures (must be IEEE P1363)', () => {
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const ecJwk = ecJwkFromPublicKey(publicKey, 'ec-key');
+    const now = Math.floor(Date.now() / 1000);
+    const header = base64UrlJson({ alg: 'ES256', typ: 'JWT', kid: 'ec-key' });
+    const payload = base64UrlJson({ iss: 'https://issuer.example', aud: 'client-id', sub: 'user-ec', exp: now + 3600 });
+    const signingInput = `${header}.${payload}`;
+    const der = crypto.sign('sha256', Buffer.from(signingInput), privateKey);
+    const jwt = `${signingInput}.${der.toString('base64url')}`;
+
+    expect(() =>
+      verifyIdToken(jwt, [ecJwk], { audience: 'client-id', issuer: 'https://issuer.example', nowSeconds: now }),
+    ).toThrow(/Invalid JWT signature/);
+  });
+
+  it('rejects id_tokens without exp', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const jwt = signRs256Jwt({ iss: 'https://issuer.example', aud: 'client-id', sub: 'user-1' }, privateKey);
+    expect(() =>
+      verifyIdToken(jwt, [jwk], { audience: 'client-id', issuer: 'https://issuer.example', nowSeconds: now }),
+    ).toThrow(/missing exp/);
   });
 
   it('rejects unsupported JWT algorithms', () => {

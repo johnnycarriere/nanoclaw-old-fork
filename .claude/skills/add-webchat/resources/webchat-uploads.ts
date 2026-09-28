@@ -5,7 +5,6 @@ import Busboy from 'busboy';
 import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
-import os from 'os';
 import path from 'path';
 import { pipeline as pipelineCallback } from 'stream';
 import { pipeline as pipelinePromise } from 'stream/promises';
@@ -13,10 +12,16 @@ import { pipeline as pipelinePromise } from 'stream/promises';
 import { DATA_DIR } from './config.js';
 import { inferAttachmentMime } from './webchat-serve-attachment.js';
 
-export const DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024;
+/** 50 MiB — matches the nginx `client_max_body_size 50m` in deploy/. */
+export const DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 export const MAX_UPLOAD_BYTES =
   Number.parseInt(process.env.WEBCHAT_MAX_UPLOAD_BYTES ?? '', 10) || DEFAULT_MAX_UPLOAD_BYTES;
 export const CHUNK_SIZE = 512 * 1024;
+/** Upper bound on totalChunks for a chunked upload (derived from MAX_UPLOAD_BYTES). */
+export const MAX_TOTAL_CHUNKS = Math.max(1, Math.ceil(MAX_UPLOAD_BYTES / CHUNK_SIZE));
+/** In-progress chunked uploads allowed at once, process-wide and per user. */
+export const MAX_PENDING_CHUNK_UPLOADS = 32;
+export const MAX_PENDING_CHUNK_UPLOADS_PER_USER = 4;
 /** In-progress chunked assembly; refreshed on each received chunk. */
 export const CHUNK_UPLOAD_TIMEOUT = 5 * 60 * 1000;
 /** Completed staging entries waiting for message POST. */
@@ -52,6 +57,7 @@ interface PendingChunkUpload {
   timer: ReturnType<typeof setTimeout>;
   platformId: string;
   threadId: string;
+  ownerId: string;
 }
 
 const completedUploads = new Map<string, StagedUpload>();
@@ -59,6 +65,36 @@ const pendingChunkedUploads = new Map<string, PendingChunkUpload>();
 
 export function uploadsStagingRoot(): string {
   return path.join(DATA_DIR, 'webchat-uploads');
+}
+
+/** Chunk parts are staged here (not os.tmpdir()) so they live with the data dir and get swept on boot. */
+export function chunkStagingRoot(): string {
+  return path.join(uploadsStagingRoot(), 'staging');
+}
+
+function chunkStagingDir(uploadId: string): string {
+  return path.join(chunkStagingRoot(), uploadId);
+}
+
+/**
+ * Remove everything under the uploads root. Staged uploads are tracked only in
+ * memory, so after a restart nothing can reference what is on disk.
+ */
+export function sweepUploadStaging(): void {
+  const root = uploadsStagingRoot();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    try {
+      fs.rmSync(path.join(root, entry), { recursive: true, force: true });
+    } catch {
+      // ignore sweep failures
+    }
+  }
 }
 
 function stagedUploadDir(uploadId: string): string {
@@ -186,38 +222,41 @@ export async function parseMultipartUpload(
       resolve(value);
     };
 
-    busboy.on('file', (_field: string, stream: NodeJS.ReadableStream, info: { filename?: string; mimeType?: string }) => {
-      fs.mkdirSync(uploadDir, { recursive: true });
-      partialPath = finalPath;
-      fileMeta = {
-        name: info.filename || 'upload',
-        mimeType: inferAttachmentMime(info.filename || 'upload', info.mimeType || ''),
-      };
-      const ws = fs.createWriteStream(finalPath);
-      fileWriteStream = ws;
-      fileWriteDone = new Promise<void>((resolveWrite) => {
-        pipelineCallback(stream, ws, (err) => {
-          if (err && !limitHit) writeError = true;
-          resolveWrite();
+    busboy.on(
+      'file',
+      (_field: string, stream: NodeJS.ReadableStream, info: { filename?: string; mimeType?: string }) => {
+        fs.mkdirSync(uploadDir, { recursive: true });
+        partialPath = finalPath;
+        fileMeta = {
+          name: info.filename || 'upload',
+          mimeType: inferAttachmentMime(info.filename || 'upload', info.mimeType || ''),
+        };
+        const ws = fs.createWriteStream(finalPath);
+        fileWriteStream = ws;
+        fileWriteDone = new Promise<void>((resolveWrite) => {
+          pipelineCallback(stream, ws, (err) => {
+            if (err && !limitHit) writeError = true;
+            resolveWrite();
+          });
         });
-      });
 
-      stream.on('error', () => {
-        writeError = true;
-        ws.destroy();
-      });
+        stream.on('error', () => {
+          writeError = true;
+          ws.destroy();
+        });
 
-      stream.on('limit', () => {
-        limitHit = true;
-        ws.destroy();
-        cleanupPartial();
-        try {
-          fs.rmSync(uploadDir, { recursive: true, force: true });
-        } catch {
-          // ignore
-        }
-      });
-    });
+        stream.on('limit', () => {
+          limitHit = true;
+          ws.destroy();
+          cleanupPartial();
+          try {
+            fs.rmSync(uploadDir, { recursive: true, force: true });
+          } catch {
+            // ignore
+          }
+        });
+      },
+    );
 
     busboy.on('finish', () => {
       void (async () => {
@@ -305,9 +344,7 @@ export type AcceptChunkResult =
   | { ok: true; upload?: StagedUpload; received: number; total: number }
   | { ok: false; error: string; status: number };
 
-export function isAcceptChunkOk(
-  result: AcceptChunkResult,
-): result is Extract<AcceptChunkResult, { ok: true }> {
+export function isAcceptChunkOk(result: AcceptChunkResult): result is Extract<AcceptChunkResult, { ok: true }> {
   return result.ok;
 }
 
@@ -329,10 +366,20 @@ function refreshChunkTimer(uploadId: string, upload: PendingChunkUpload): void {
   upload.timer = setTimeout(() => cleanupChunkedUpload(uploadId), CHUNK_UPLOAD_TIMEOUT);
 }
 
+function pendingUploadsForOwner(ownerId: string): number {
+  let count = 0;
+  for (const upload of pendingChunkedUploads.values()) {
+    if (upload.ownerId === ownerId) count++;
+  }
+  return count;
+}
+
 export async function acceptChunk(
   body: ChunkUploadBody,
   platformId: string,
   threadId: string,
+  /** Requesting user id; bounds concurrent pending uploads per user. */
+  ownerId = 'local',
 ): Promise<AcceptChunkResult> {
   const { uploadId, chunkIndex, totalChunks, filename, data } = body;
   const mimeType = inferAttachmentMime(filename, body.mimeType ?? '');
@@ -350,13 +397,27 @@ export async function acceptChunk(
     return { ok: false, error: 'Missing or invalid required fields', status: 400 };
   }
 
+  if (totalChunks > MAX_TOTAL_CHUNKS) {
+    return {
+      ok: false,
+      error: `totalChunks exceeds ${MAX_TOTAL_CHUNKS} (${formatMaxUploadLabel()} limit)`,
+      status: 413,
+    };
+  }
+
   if (!isValidUploadId(uploadId)) {
     return { ok: false, error: 'Invalid uploadId format', status: 400 };
   }
 
   let upload = pendingChunkedUploads.get(uploadId);
   if (!upload) {
-    const tempDir = path.join(os.tmpdir(), `nanoclaw-webchat-chunk-${uploadId}`);
+    if (pendingChunkedUploads.size >= MAX_PENDING_CHUNK_UPLOADS) {
+      return { ok: false, error: 'Too many uploads in progress', status: 429 };
+    }
+    if (pendingUploadsForOwner(ownerId) >= MAX_PENDING_CHUNK_UPLOADS_PER_USER) {
+      return { ok: false, error: 'Too many uploads in progress for this user', status: 429 };
+    }
+    const tempDir = chunkStagingDir(uploadId);
     fs.mkdirSync(tempDir, { recursive: true });
     upload = {
       filename,
@@ -368,11 +429,14 @@ export async function acceptChunk(
       timer: undefined as unknown as NodeJS.Timeout,
       platformId,
       threadId,
+      ownerId,
     };
     pendingChunkedUploads.set(uploadId, upload);
     refreshChunkTimer(uploadId, upload);
   } else if (totalChunks !== upload.totalChunks) {
     return { ok: false, error: 'totalChunks mismatch', status: 400 };
+  } else if (upload.ownerId !== ownerId) {
+    return { ok: false, error: 'uploadId belongs to another user', status: 403 };
   }
 
   if (upload.receivedChunks.has(chunkIndex)) {

@@ -11,17 +11,24 @@ import { authConfigForTests } from './webchat-auth-config.js';
 import {
   checkOidcAllowlist,
   handlePublicAuthRequest,
+  hashBasicPassword,
+  LOGIN_BACKOFF_THRESHOLD,
+  LOGIN_IP_BUCKET_CAPACITY,
+  resetLoginRateLimitForTests,
   resetWebchatAuthCachesForTests,
   validateBasicLogin,
+  verifyBasicPasswordHash,
   verifyOidcIdTokenForTests,
 } from './webchat-auth.js';
 import {
   createSession,
   getSession,
+  hashOAuthNonce,
   parseSessionCookie,
   resetWebchatAuthSchemaForTests,
   saveOAuthState,
   signSessionCookie,
+  WEBCHAT_OAUTH_NONCE_COOKIE,
 } from './webchat-auth-sessions.js';
 import type { IncomingMessage, ServerResponse } from 'http';
 
@@ -48,6 +55,7 @@ function rsaJwkFromPublicKey(publicKey: crypto.KeyObject, kid: string) {
 describe('webchat-auth', () => {
   beforeEach(() => {
     resetWebchatAuthCachesForTests();
+    resetLoginRateLimitForTests();
     resetWebchatAuthSchemaForTests();
     if (fs.existsSync(TEST_DATA)) fs.rmSync(TEST_DATA, { recursive: true, force: true });
     fs.mkdirSync(TEST_DATA, { recursive: true });
@@ -77,6 +85,92 @@ describe('webchat-auth', () => {
     expect(validateBasicLogin(cfg, 'bob', 'hunter2')).toBeNull();
     expect(validateBasicLogin(cfg, 'alice', 'wrong')).toBeNull();
     expect(validateBasicLogin(cfg, 'alic', 'hunter2')).toBeNull();
+  });
+
+  it('validates per-user password hashes from WEBCHAT_BASIC_USERS and keeps the legacy password working', () => {
+    const aliceHash = hashBasicPassword('alice-pw');
+    expect(aliceHash).toMatch(/^scrypt\$[A-Za-z0-9_-]+\$[A-Za-z0-9_-]+$/);
+    expect(verifyBasicPasswordHash('alice-pw', aliceHash)).toBe(true);
+    expect(verifyBasicPasswordHash('wrong', aliceHash)).toBe(false);
+    const sha = `sha256$${crypto.createHash('sha256').update('carol-pw').digest('hex')}`;
+    expect(verifyBasicPasswordHash('carol-pw', sha)).toBe(true);
+    expect(verifyBasicPasswordHash('x', 'bogus')).toBe(false);
+
+    const cfg = authConfigForTests({
+      mode: 'public',
+      public: {
+        sessionSecret: 'secret',
+        sessionTtlSeconds: 3600,
+        redirectUri: 'http://localhost/cb',
+        oidcEnabled: false,
+        providers: [],
+        allowlist: { emailDomains: [], emails: [], subs: [], requiredGroup: null },
+        basic: {
+          enabled: true,
+          password: 'legacy-pw',
+          allowedUsernames: ['bob'],
+          displayNames: new Map([['alice', 'Alice']]),
+          users: new Map([
+            ['alice', aliceHash],
+            ['carol', sha],
+          ]),
+        },
+        secureCookies: false,
+      },
+    }).public!;
+
+    expect(validateBasicLogin(cfg, 'Alice', 'alice-pw')?.displayName).toBe('Alice');
+    expect(validateBasicLogin(cfg, 'alice', 'legacy-pw')).toBeNull();
+    expect(validateBasicLogin(cfg, 'carol', 'carol-pw')?.userId).toBe('web:basic:carol');
+    // Legacy shared password still works for allowlisted usernames without a hash.
+    expect(validateBasicLogin(cfg, 'bob', 'legacy-pw')?.userId).toBe('web:basic:bob');
+    expect(validateBasicLogin(cfg, 'bob', 'alice-pw')).toBeNull();
+  });
+
+  it('rate limits basic login by IP bucket and per-username backoff', async () => {
+    const cfg = authConfigForTests({
+      mode: 'public',
+      public: {
+        sessionSecret: 'secret',
+        sessionTtlSeconds: 3600,
+        redirectUri: 'http://localhost/cb',
+        oidcEnabled: false,
+        providers: [],
+        allowlist: { emailDomains: [], emails: [], subs: [], requiredGroup: null },
+        basic: { enabled: true, password: 'hunter2', allowedUsernames: ['alice'], displayNames: new Map() },
+        secureCookies: false,
+      },
+    }).public!;
+
+    async function attempt(ip: string, username: string, password: string): Promise<number> {
+      const { Readable } = await import('stream');
+      const body = Readable.from([Buffer.from(JSON.stringify({ username, password }))]) as unknown as IncomingMessage;
+      Object.assign(body, {
+        method: 'POST',
+        headers: { 'x-real-ip': ip },
+        socket: { remoteAddress: '127.0.0.1' },
+      });
+      let status = 0;
+      const json = (_res: ServerResponse, code: number) => {
+        status = code;
+      };
+      const res = { setHeader() {}, getHeader() {}, writeHead() {}, end() {} } as unknown as ServerResponse;
+      await handlePublicAuthRequest(body, res, new URL('http://localhost/api/auth/login/basic'), cfg, json, () => {});
+      return status;
+    }
+
+    // Per-username backoff: after LOGIN_BACKOFF_THRESHOLD failures the next attempt is 429
+    // even with the right password and from a different IP.
+    for (let i = 0; i < LOGIN_BACKOFF_THRESHOLD; i++) {
+      expect(await attempt(`10.0.0.${i}`, 'alice', 'wrong')).toBe(401);
+    }
+    expect(await attempt('10.0.0.99', 'alice', 'hunter2')).toBe(429);
+
+    // IP bucket: one IP burning through its burst capacity gets 429 regardless of username.
+    for (let i = 0; i < LOGIN_IP_BUCKET_CAPACITY; i++) {
+      expect(await attempt('10.9.9.9', `user${i}`, 'wrong')).toBe(401);
+    }
+    expect(await attempt('10.9.9.9', 'someone-else', 'wrong')).toBe(429);
   });
 
   it('matches allowed usernames with constant-time comparison across the list', () => {
@@ -230,7 +324,8 @@ describe('webchat-auth', () => {
       },
     }).public!;
 
-    saveOAuthState('test-state', 'github', 'verifier');
+    const nonce = 'browser-nonce';
+    saveOAuthState('test-state', 'github', 'verifier', hashOAuthNonce(nonce));
 
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       const url = String(input);
@@ -260,10 +355,16 @@ describe('webchat-auth', () => {
       setHeader(name: string, value: string | number | readonly string[]) {
         headers[name] = value as string;
       },
+      getHeader(name: string) {
+        return headers[name];
+      },
       end() {},
     } as unknown as ServerResponse;
 
-    const req = { method: 'GET', headers: {} } as IncomingMessage;
+    const req = {
+      method: 'GET',
+      headers: { cookie: `${WEBCHAT_OAUTH_NONCE_COOKIE}=${nonce}` },
+    } as IncomingMessage;
     const url = new URL('http://localhost/api/auth/callback?code=abc&state=test-state');
 
     try {
@@ -280,7 +381,7 @@ describe('webchat-auth', () => {
       expect(statusCode).toBe(302);
       expect(headers.Location).toBe('/webchat/');
 
-      saveOAuthState('test-state-root', 'github', 'verifier');
+      saveOAuthState('test-state-root', 'github', 'verifier', hashOAuthNonce(nonce));
       statusCode = 0;
       delete headers.Location;
       const handledRoot = await handlePublicAuthRequest(
@@ -319,6 +420,34 @@ describe('webchat-auth', () => {
       expect(cancelled).toBe(true);
       expect(statusCode).toBe(403);
       expect(htmlBody).toContain('href="/webchat/"');
+
+      // State nonce bound to another browser (missing / different cookie) is rejected.
+      saveOAuthState('test-state-other', 'github', 'verifier', hashOAuthNonce('other-browser'));
+      statusCode = 0;
+      const mismatched = await handlePublicAuthRequest(
+        req,
+        htmlRes,
+        new URL('http://localhost/api/auth/callback?code=abc&state=test-state-other'),
+        cfg,
+        () => {},
+        () => {},
+      );
+      expect(mismatched).toBe(true);
+      expect(statusCode).toBe(400);
+      expect(htmlBody).toContain('does not belong to this browser');
+
+      saveOAuthState('test-state-nocookie', 'github', 'verifier', hashOAuthNonce(nonce));
+      statusCode = 0;
+      const noCookie = await handlePublicAuthRequest(
+        { method: 'GET', headers: {} } as IncomingMessage,
+        htmlRes,
+        new URL('http://localhost/api/auth/callback?code=abc&state=test-state-nocookie'),
+        cfg,
+        () => {},
+        () => {},
+      );
+      expect(noCookie).toBe(true);
+      expect(statusCode).toBe(400);
     } finally {
       fetchMock.mockRestore();
     }

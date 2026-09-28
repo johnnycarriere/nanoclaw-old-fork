@@ -10,7 +10,12 @@ const indexPath = path.resolve(process.cwd(), 'src/index.ts');
 const source = fs.readFileSync(indexPath, 'utf8');
 const sf = ts.createSourceFile('index.ts', source, ts.ScriptTarget.Latest, true);
 
-function mainBody(): ts.NodeArray<ts.Statement> {
+/**
+ * Top-level statements of main(), with `try { … }` blocks flattened in place:
+ * the fork wraps the webchat boot in try/catch so a boot failure cannot
+ * crash-loop the host, and the ordering guarantees still hold through it.
+ */
+function mainBody(): ts.Statement[] {
   let body: ts.NodeArray<ts.Statement> | undefined;
   sf.forEachChild((n) => {
     if (ts.isFunctionDeclaration(n) && n.name?.text === 'main' && n.body) {
@@ -18,7 +23,7 @@ function mainBody(): ts.NodeArray<ts.Statement> {
     }
   });
   if (!body) throw new Error('main() not found in src/index.ts');
-  return body;
+  return body.flatMap((s) => (ts.isTryStatement(s) ? [...s.tryBlock.statements] : [s]));
 }
 
 function isAwaitedStartWebChat(s: ts.Statement): boolean {

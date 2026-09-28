@@ -76,7 +76,8 @@ function verifyJwtSignature(
     return crypto.verify('RSA-SHA256', Buffer.from(signingInput), publicKey, signature);
   }
   if (alg === 'ES256') {
-    return crypto.verify('sha256', Buffer.from(signingInput), publicKey, signature);
+    // JWS ES256 signatures are raw R||S (IEEE P1363), not DER.
+    return crypto.verify('sha256', Buffer.from(signingInput), { key: publicKey, dsaEncoding: 'ieee-p1363' }, signature);
   }
   return false;
 }
@@ -85,7 +86,10 @@ function validateIdTokenClaims(payload: Record<string, unknown>, options: IdToke
   const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
   const skew = options.clockSkewSeconds ?? 60;
 
-  if (typeof payload.exp === 'number' && payload.exp + skew < now) {
+  if (typeof payload.exp !== 'number') {
+    throw new Error('JWT missing exp');
+  }
+  if (payload.exp + skew < now) {
     throw new Error('JWT expired');
   }
   if (typeof payload.nbf === 'number' && payload.nbf - skew > now) {

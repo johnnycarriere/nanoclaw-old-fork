@@ -37,9 +37,7 @@ describe('webchat-routing', () => {
   });
 
   it('builds routing metadata with peer reply flag', () => {
-    expect(
-      buildRoutingMetadata('diego', [], [], ['diego', 'rahul'], true),
-    ).toMatchObject({
+    expect(buildRoutingMetadata('diego', [], [], ['diego', 'rahul'], true)).toMatchObject({
       responseExpectation: 'defer',
       isPeerReply: true,
       engagedAgents: ['diego', 'rahul'],
@@ -55,10 +53,7 @@ describe('webchat-routing', () => {
   });
 
   it('formats backfill intro without message bodies', () => {
-    const block = backfillIntroLine(
-      'Review PR',
-      [{ folder: 'diego', displayName: 'Diego' }],
-    );
+    const block = backfillIntroLine('Review PR', [{ folder: 'diego', displayName: 'Diego' }]);
     expect(block).toContain('Review PR');
     expect(block).toContain('Other agents listening: Diego');
     expect(block).toContain('Recent thread messages follow');

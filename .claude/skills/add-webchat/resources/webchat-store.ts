@@ -63,22 +63,6 @@ CREATE TABLE IF NOT EXISTS web_thread_backfill_delivered (
 
 /** Applied after thread_seq column migration (existing DBs lack the column until ALTER). */
 const WEBCHAT_THREAD_SEQ_SCHEMA = `
-CREATE TABLE IF NOT EXISTS web_activity (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  platform_id TEXT NOT NULL,
-  thread_id TEXT NOT NULL,
-  turn_id TEXT NOT NULL,
-  seq INTEGER NOT NULL,
-  timestamp TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  tool TEXT,
-  payload_json TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_web_activity_room
-  ON web_activity(platform_id, thread_id, id DESC);
-
 CREATE TABLE IF NOT EXISTS web_thread_seq (
   platform_id  TEXT NOT NULL,
   thread_id    TEXT NOT NULL,
@@ -197,6 +181,11 @@ export function ensureWebchatSchema(): void {
     } catch {
       // column already exists
     }
+    try {
+      db.exec('ALTER TABLE web_threads ADD COLUMN created_by TEXT');
+    } catch {
+      // column already exists
+    }
     db.exec(WEBCHAT_THREAD_SEQ_SCHEMA);
     backfillThreadSeqForExistingMessages(db);
   } finally {
@@ -271,13 +260,13 @@ export function listThreads(platformId: string): WebchatThreadMeta[] {
   }
 }
 
-export function upsertThread(platformId: string, threadId: string, title: string): void {
+export function upsertThread(platformId: string, threadId: string, title: string, createdBy?: string): void {
   const now = new Date().toISOString();
   const db = openDb();
   try {
     db.prepare(
-      `INSERT INTO web_threads (platform_id, thread_id, title, created_at, updated_at)
-       VALUES (@platform_id, @thread_id, @title, @created_at, @updated_at)
+      `INSERT INTO web_threads (platform_id, thread_id, title, created_at, updated_at, created_by)
+       VALUES (@platform_id, @thread_id, @title, @created_at, @updated_at, @created_by)
        ON CONFLICT(platform_id, thread_id) DO UPDATE SET
          title = excluded.title,
          updated_at = excluded.updated_at`,
@@ -287,16 +276,43 @@ export function upsertThread(platformId: string, threadId: string, title: string
       title,
       created_at: now,
       updated_at: now,
+      created_by: createdBy ?? null,
     });
   } finally {
     db.close();
   }
 }
 
-export function createThread(platformId: string, title: string): WebchatThreadMeta {
+export function createThread(platformId: string, title: string, createdBy?: string): WebchatThreadMeta {
   const threadId = newThreadId();
-  upsertThread(platformId, threadId, title);
+  upsertThread(platformId, threadId, title, createdBy);
   return { id: threadId, title };
+}
+
+/** User id that created the thread (null for legacy rows / unknown threads). */
+export function getThreadCreator(platformId: string, threadId: string): string | null {
+  const db = openDb();
+  try {
+    const row = db
+      .prepare(`SELECT created_by FROM web_threads WHERE platform_id = ? AND thread_id = ?`)
+      .get(platformId, threadId) as { created_by: string | null } | undefined;
+    return row?.created_by ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+/** Room + thread a message belongs to (for attachment authz), or null when unknown. */
+export function getMessageLocation(messageId: string): { platformId: string; threadId: string } | null {
+  const db = openDb();
+  try {
+    const row = db.prepare(`SELECT platform_id, thread_id FROM web_messages WHERE id = ?`).get(messageId) as
+      | { platform_id: string; thread_id: string }
+      | undefined;
+    return row ? { platformId: row.platform_id, threadId: row.thread_id } : null;
+  } finally {
+    db.close();
+  }
 }
 
 function sanitizeStorageName(name: string, index: number): string {
@@ -375,8 +391,7 @@ export function appendMessageWithAttachmentMeta(
     db.close();
   }
 
-  const apiAttachments =
-    storedAttachments.length > 0 ? storedToApiAttachments(msg.id, storedAttachments) : undefined;
+  const apiAttachments = storedAttachments.length > 0 ? storedToApiAttachments(msg.id, storedAttachments) : undefined;
 
   return {
     ...msg,
@@ -969,128 +984,6 @@ export function updateMessageCard(messageId: string, card: WebchatAskQuestionCar
     db.prepare('UPDATE web_messages SET card_json = ? WHERE id = ?').run(JSON.stringify(card), messageId);
 
     return rowToMessage({ ...row, card_json: JSON.stringify(card) }, row.platform_id, row.thread_id);
-  } finally {
-    db.close();
-  }
-}
-
-const MAX_ACTIVITY_TURNS = 50;
-/** Only replay in-flight / very recent activity on room open (WS reconnect during a turn). */
-const ACTIVITY_REPLAY_MAX_AGE_MS = 3 * 60 * 1000;
-
-export interface StoredActivityEvent {
-  turnId: string;
-  seq: number;
-  timestamp: string;
-  kind: string;
-  summary: string;
-  tool?: string;
-  phase?: string;
-  replaceKey?: string;
-  keepalive?: boolean;
-  agentName?: string;
-  agentFolder?: string;
-}
-
-function pruneActivityTurns(
-  db: ReturnType<typeof openDb>,
-  platformId: string,
-  threadId: string,
-): void {
-  const cutoff = new Date(Date.now() - ACTIVITY_REPLAY_MAX_AGE_MS).toISOString();
-  db.prepare(
-    `DELETE FROM web_activity WHERE platform_id = ? AND thread_id = ? AND timestamp < ?`,
-  ).run(platformId, threadId, cutoff);
-
-  // Evict oldest turns beyond the cap in one statement (latest N by MAX(id)).
-  db.prepare(
-    `DELETE FROM web_activity
-     WHERE platform_id = ? AND thread_id = ?
-       AND turn_id NOT IN (
-         SELECT turn_id FROM web_activity
-         WHERE platform_id = ? AND thread_id = ?
-         GROUP BY turn_id
-         ORDER BY MAX(id) DESC
-         LIMIT ?
-       )`,
-  ).run(platformId, threadId, platformId, threadId, MAX_ACTIVITY_TURNS);
-}
-
-export function appendActivityEvent(
-  platformId: string,
-  threadId: string,
-  event: StoredActivityEvent,
-): void {
-  const db = openDb();
-  try {
-    db.prepare(
-      `INSERT INTO web_activity (platform_id, thread_id, turn_id, seq, timestamp, kind, summary, tool, payload_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      platformId,
-      threadId,
-      event.turnId,
-      event.seq,
-      event.timestamp,
-      event.kind,
-      event.summary,
-      event.tool ?? null,
-      JSON.stringify(event),
-    );
-
-    // Cap check only when a new turn starts — mid-turn events can't add a turn_id.
-    if (event.seq === 0 || event.kind === 'turn_start') {
-      pruneActivityTurns(db, platformId, threadId);
-    }
-  } finally {
-    db.close();
-  }
-}
-
-export function getActivityEvents(
-  platformId: string,
-  threadId: string,
-  limit = 200,
-): StoredActivityEvent[] {
-  const db = openDb();
-  try {
-    const cutoff = new Date(Date.now() - ACTIVITY_REPLAY_MAX_AGE_MS).toISOString();
-    const rows = db
-      .prepare(
-        `SELECT payload_json FROM web_activity
-         WHERE platform_id = ? AND thread_id = ? AND timestamp >= ?
-         ORDER BY id DESC
-         LIMIT ?`,
-      )
-      .all(platformId, threadId, cutoff, limit) as Array<{ payload_json: string }>;
-    return rows
-      .map((r) => {
-        try {
-          return JSON.parse(r.payload_json) as StoredActivityEvent;
-        } catch {
-          return null;
-        }
-      })
-      .filter((e): e is StoredActivityEvent => e != null)
-      .reverse();
-  } finally {
-    db.close();
-  }
-}
-
-export function clearActivityTurn(platformId: string, threadId: string, turnId?: string): void {
-  const db = openDb();
-  try {
-    if (turnId) {
-      db.prepare(
-        `DELETE FROM web_activity WHERE platform_id = ? AND thread_id = ? AND turn_id = ?`,
-      ).run(platformId, threadId, turnId);
-    } else {
-      db.prepare(`DELETE FROM web_activity WHERE platform_id = ? AND thread_id = ?`).run(
-        platformId,
-        threadId,
-      );
-    }
   } finally {
     db.close();
   }

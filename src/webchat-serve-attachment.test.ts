@@ -5,6 +5,8 @@ import path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  attachmentContentDisposition,
+  attachmentResponseContentType,
   mimeTypeFromFilename,
   parseAttachmentByteRange,
   serveAttachmentFile,
@@ -92,6 +94,34 @@ describe('webchat-serve-attachment', () => {
     expect(res.headers['content-type']).toBe('application/octet-stream');
     expect(res.headers['content-length']).toBe('11');
     expect(res.headers['accept-ranges']).toBe('bytes');
+    expect(res.headers['content-disposition']).toBe(`attachment; filename="data.bin"; filename*=UTF-8''data.bin`);
+    expect(res.headers['content-security-policy']).toBe('sandbox');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+  });
+
+  it('serves active content (html/svg/js/xml) as text/plain downloads', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'serve-att-'));
+    const filePath = path.join(tempDir, '0-page.html');
+    fs.writeFileSync(filePath, Buffer.from('<script>alert(1)</script>'));
+
+    const res = await requestFile(filePath, '0-page.html');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('text/plain; charset=utf-8');
+    expect(res.headers['content-disposition']).toBe(`attachment; filename="page.html"; filename*=UTF-8''page.html`);
+    expect(res.headers['content-security-policy']).toBe('sandbox');
+
+    for (const name of ['a.htm', 'b.svg', 'c.xml', 'd.js', 'e.mjs', 'F.HTML']) {
+      expect(attachmentResponseContentType(name)).toBe('text/plain; charset=utf-8');
+    }
+    expect(attachmentResponseContentType('photo.png')).toBe('image/png');
+    expect(attachmentResponseContentType('1-notes.md')).toBe('text/markdown');
+  });
+
+  it('builds a safe Content-Disposition for odd filenames', () => {
+    expect(attachmentContentDisposition('2-we"ird\\name é.txt')).toBe(
+      `attachment; filename="we_ird_name _.txt"; filename*=UTF-8''${encodeURIComponent('we"ird\\name é.txt')}`,
+    );
+    expect(attachmentContentDisposition('')).toBe(`attachment; filename="attachment"; filename*=UTF-8''attachment`);
   });
 
   it('returns 404 for missing files', async () => {

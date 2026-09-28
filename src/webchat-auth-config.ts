@@ -25,9 +25,12 @@ export interface OidcProviderConfig {
 
 export interface BasicAuthConfig {
   enabled: boolean;
+  /** Legacy shared password (WEBCHAT_BASIC_PASSWORD); empty when only per-user hashes are configured. */
   password: string;
   allowedUsernames: string[];
   displayNames: Map<string, string>;
+  /** Per-user password hashes from WEBCHAT_BASIC_USERS (`username:<hash>`), keyed by lowercase username. */
+  users?: Map<string, string>;
 }
 
 export interface OidcAllowlistConfig {
@@ -55,6 +58,8 @@ export interface WebAdapterAuthConfig {
   localUserId: string;
   localDisplayName: string;
   mcpHttpEnabled: boolean;
+  /** Allow OAuth dynamic client registration on /register (WEBCHAT_MCP_ALLOW_DCR=true). Default off. */
+  mcpAllowDynamicClientRegistration: boolean;
   publicBaseUrl?: string;
   /** MCP access-token TTL in seconds (default 86400). */
   mcpTokenTtlSeconds?: number;
@@ -83,9 +88,11 @@ const ENV_KEYS = [
   'WEBCHAT_OIDC_ALLOWED_SUBS',
   'WEBCHAT_OIDC_REQUIRED_GROUP',
   'WEBCHAT_BASIC_PASSWORD',
+  'WEBCHAT_BASIC_USERS',
   'WEBCHAT_BASIC_ALLOWED_USERNAMES',
   'WEBCHAT_BASIC_DISPLAY_NAMES',
   'WEBCHAT_MCP_HTTP_ENABLED',
+  'WEBCHAT_MCP_ALLOW_DCR',
   'WEBCHAT_MCP_TOKEN_TTL_SECONDS',
   'WEBCHAT_PUBLIC_BASE_URL',
 ] as const;
@@ -107,11 +114,46 @@ function resolvePublicBaseUrl(file: Record<string, string | undefined>): string 
   return undefined;
 }
 
-function resolveMcpHttpEnabled(mode: WebchatAuthMode, file: Record<string, string | undefined>): boolean {
-  const raw = env('WEBCHAT_MCP_HTTP_ENABLED', file);
-  if (raw === 'true') return true;
-  if (raw === 'false') return false;
-  return mode === 'public';
+/** MCP HTTP transport is opt-in in both modes (WEBCHAT_MCP_HTTP_ENABLED=true). */
+function resolveMcpHttpEnabled(_mode: WebchatAuthMode, file: Record<string, string | undefined>): boolean {
+  return env('WEBCHAT_MCP_HTTP_ENABLED', file) === 'true';
+}
+
+function resolveMcpAllowDcr(file: Record<string, string | undefined>): boolean {
+  return env('WEBCHAT_MCP_ALLOW_DCR', file) === 'true';
+}
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  if (LOOPBACK_HOSTS.has(h)) return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Local mode has no per-user auth (static secret + injected token), so it must
+ * never be reachable beyond loopback. Throw at load time rather than exposing it.
+ */
+function assertLocalModeIsLoopbackOnly(bindAddress: string, publicBaseUrl: string | undefined): void {
+  if (!isLoopbackHost(bindAddress)) {
+    throw new Error(
+      `WEBCHAT_BIND_ADDRESS=${bindAddress} is not loopback; set WEBCHAT_AUTH_MODE=public (with WEBCHAT_SESSION_SECRET and basic/OIDC auth) to expose webchat beyond localhost`,
+    );
+  }
+  if (publicBaseUrl) {
+    let host: string;
+    try {
+      host = new URL(publicBaseUrl).hostname;
+    } catch (err) {
+      throw new Error(`WEBCHAT_PUBLIC_BASE_URL is not a valid URL: ${publicBaseUrl}`, { cause: err });
+    }
+    if (!isLoopbackHost(host)) {
+      throw new Error(
+        `WEBCHAT_PUBLIC_BASE_URL=${publicBaseUrl} points at a non-loopback host but WEBCHAT_AUTH_MODE is local; set WEBCHAT_AUTH_MODE=public before exposing webchat`,
+      );
+    }
+  }
 }
 
 function resolveMcpTokenTtlSeconds(file: Record<string, string | undefined>): number {
@@ -141,16 +183,33 @@ function parseCsv(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function parseDisplayNames(raw: string | undefined): Map<string, string> {
+function parseUserColonValue(raw: string | undefined): Map<string, string> {
   const map = new Map<string, string>();
   for (const entry of parseCsv(raw)) {
     const idx = entry.indexOf(':');
     if (idx <= 0) continue;
     const user = entry.slice(0, idx).trim().toLowerCase();
-    const name = entry.slice(idx + 1).trim();
-    if (user && name) map.set(user, name);
+    const value = entry.slice(idx + 1).trim();
+    if (user && value) map.set(user, value);
   }
   return map;
+}
+
+function parseDisplayNames(raw: string | undefined): Map<string, string> {
+  return parseUserColonValue(raw);
+}
+
+/** `username:<hash>` entries; hash is `scrypt$<salt>$<key>` (from hashBasicPassword) or `sha256$<hex>`. */
+function parseBasicUsers(raw: string | undefined): Map<string, string> {
+  const users = parseUserColonValue(raw);
+  for (const [user, hash] of users) {
+    if (!/^(scrypt\$[A-Za-z0-9_-]+\$[A-Za-z0-9_-]+|sha256\$[0-9a-fA-F]{64})$/.test(hash)) {
+      throw new Error(
+        `WEBCHAT_BASIC_USERS entry for "${user}" is not a supported hash (expected scrypt$<salt>$<key> from hashBasicPassword, or sha256$<hex>)`,
+      );
+    }
+  }
+  return users;
 }
 
 function loadProvidersJson(raw: string): OidcProviderConfig[] {
@@ -221,11 +280,15 @@ export function loadWebAdapterAuthConfig(): WebAdapterAuthConfig | null {
     localUserId,
     localDisplayName,
     mcpHttpEnabled: resolveMcpHttpEnabled(mode, file),
+    mcpAllowDynamicClientRegistration: resolveMcpAllowDcr(file),
     publicBaseUrl: resolvePublicBaseUrl(file),
     mcpTokenTtlSeconds: resolveMcpTokenTtlSeconds(file),
   };
 
-  if (mode === 'local') return base;
+  if (mode === 'local') {
+    assertLocalModeIsLoopbackOnly(bindAddress, base.publicBaseUrl);
+    return base;
+  }
 
   const sessionSecret = env('WEBCHAT_SESSION_SECRET', file);
   if (!sessionSecret) {
@@ -253,10 +316,13 @@ export function loadWebAdapterAuthConfig(): WebAdapterAuthConfig | null {
 
   const basicPassword = env('WEBCHAT_BASIC_PASSWORD', file) ?? '';
   const allowedUsernames = parseCsv(env('WEBCHAT_BASIC_ALLOWED_USERNAMES', file)).map((u) => u.toLowerCase());
+  const basicUsers = basicEnabled ? parseBasicUsers(env('WEBCHAT_BASIC_USERS', file)) : new Map<string, string>();
   if (basicEnabled) {
-    if (!basicPassword) throw new Error('WEBCHAT_BASIC_PASSWORD is required when basic auth is enabled');
-    if (allowedUsernames.length === 0) {
-      throw new Error('WEBCHAT_BASIC_ALLOWED_USERNAMES is required when basic auth is enabled');
+    if (!basicPassword && basicUsers.size === 0) {
+      throw new Error('WEBCHAT_BASIC_USERS or WEBCHAT_BASIC_PASSWORD is required when basic auth is enabled');
+    }
+    if (basicPassword && allowedUsernames.length === 0) {
+      throw new Error('WEBCHAT_BASIC_ALLOWED_USERNAMES is required when WEBCHAT_BASIC_PASSWORD is set');
     }
   }
 
@@ -286,6 +352,7 @@ export function loadWebAdapterAuthConfig(): WebAdapterAuthConfig | null {
       password: basicPassword,
       allowedUsernames,
       displayNames: parseDisplayNames(env('WEBCHAT_BASIC_DISPLAY_NAMES', file)),
+      users: basicUsers,
     },
     secureCookies: resolveSecureCookies(file),
   };
@@ -313,6 +380,7 @@ export function authConfigForTests(overrides: Partial<WebAdapterAuthConfig> = {}
     localUserId: 'web:local',
     localDisplayName: 'Local',
     mcpHttpEnabled: false,
+    mcpAllowDynamicClientRegistration: false,
     ...overrides,
   };
 }

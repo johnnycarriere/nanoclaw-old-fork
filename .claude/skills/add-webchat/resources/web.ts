@@ -5,6 +5,7 @@
  * Routes patterns and DM rooms are wired by webchat-sync.ts; this adapter only
  * transports messages through the normal router/delivery path.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
@@ -17,10 +18,7 @@ import { getDb, hasTable } from '../db/connection.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { getPendingApproval, getSession } from '../db/sessions.js';
 import { log } from '../log.js';
-import {
-  bootstrapPayloadForUser,
-  setWebchatBootstrapBroadcaster,
-} from '../webchat-live.js';
+import { bootstrapPayloadForUser, setWebchatBootstrapBroadcaster } from '../webchat-live.js';
 import {
   buildWebchatBootstrap,
   ensureUserWebchatWirings,
@@ -28,13 +26,9 @@ import {
   readTeamFolder,
   WEB_INBOX_PLATFORM_ID,
 } from '../webchat-sync.js';
-import {
-  hasAdminPrivilege,
-  isGlobalAdmin,
-  isOwner,
-} from '../modules/permissions/db/user-roles.js';
+import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../modules/permissions/db/user-roles.js';
 import type { PublicAuthConfig } from '../webchat-auth-config.js';
-import { loadWebAdapterAuthConfig } from '../webchat-auth-config.js';
+import { isLoopbackHost, loadWebAdapterAuthConfig } from '../webchat-auth-config.js';
 import {
   handlePublicAuthRequest,
   isPublicAuthExemptPath,
@@ -44,8 +38,10 @@ import {
 import { ensureWebchatAuthSchema } from '../webchat-auth-sessions.js';
 import {
   createWebchatMcpOAuthBackend,
+  MCP_CONSENT_PATH,
   verifyMcpAccessToken,
   type McpAccessTokenUser,
+  type McpPendingConsent,
   type WebchatMcpOAuthBackend,
 } from '../webchat-mcp-oauth.js';
 import {
@@ -75,20 +71,19 @@ import {
 import { implicitMentionedFolders, mentionedAgentFolders, type ImplicitMentionAgent } from '../webchat-mentions.js';
 import {
   addEngagedAgents,
-  appendActivityEvent,
   appendMessage,
   appendMessageWithAttachmentMeta,
-  clearActivityTurn,
   createThread,
   deleteThreadData,
   deleteMessageFiles,
   ensureWebchatSchema,
   enrichMessagesWithAttachmentData,
-  getActivityEvents,
   getEngagedAgents,
   getMessageAttachmentPath,
+  getMessageLocation,
   getMessages,
   getRecentMessages,
+  getThreadCreator,
   hasBackfillDelivered,
   listThreads,
   MAIN_THREAD,
@@ -101,7 +96,6 @@ import {
   answerCardsByQuestionId,
   revertCardsByQuestionId,
   writeAttachmentFiles,
-  type StoredActivityEvent,
   type StoredAttachmentMeta,
   type WebchatAskQuestionCard,
   type WebchatAttachmentInput,
@@ -116,6 +110,7 @@ import {
   getStagedUpload,
   parseMultipartUpload,
   restoreStagedUpload,
+  sweepUploadStaging,
   type StagedUpload,
 } from '../webchat-uploads.js';
 import { inferAttachmentMime, serveAttachmentFile } from '../webchat-serve-attachment.js';
@@ -169,6 +164,8 @@ interface WebAdapterOptions {
   displayName: string;
   publicAuth?: PublicAuthConfig;
   mcpHttpEnabled?: boolean;
+  /** Expose OAuth dynamic client registration (/register). Default off — 403. */
+  mcpAllowDynamicClientRegistration?: boolean;
   publicBaseUrl?: string;
   mcpTokenTtlSeconds?: number;
 }
@@ -201,29 +198,6 @@ function extractSenderFolder(content: unknown): string | undefined {
     if (typeof folder === 'string' && folder.trim()) return folder.trim();
   }
   return undefined;
-}
-
-function extractSkipPeerFanOut(content: unknown): boolean {
-  if (content && typeof content === 'object') {
-    return (content as { skipPeerFanOut?: unknown }).skipPeerFanOut === true;
-  }
-  return false;
-}
-
-/** Provider quota / session-limit notices must not re-enter other agents. */
-function looksLikeProviderLimitNotice(text: string): boolean {
-  return /hit your (session )?limit/i.test(text) || /rate limit/i.test(text);
-}
-
-/** Best-effort agent folders for typing events (lobby engaged set, or DM folder). */
-function resolveTypingAgentFolders(platformId: string, threadId: string): string[] {
-  const engaged = getEngagedAgents(platformId, threadId);
-  if (engaged.length > 0) return engaged;
-  if (platformId.startsWith('dm:')) {
-    const folder = platformId.slice(3).split(':')[0];
-    if (folder) return [folder];
-  }
-  return [];
 }
 
 interface AskQuestionContent {
@@ -284,17 +258,17 @@ interface ApprovalSessionOrigin {
   agentName?: string;
 }
 
-function resolveApprovalSessionOrigin(questionId: string): ApprovalSessionOrigin | undefined {
+async function resolveApprovalSessionOrigin(questionId: string): Promise<ApprovalSessionOrigin | undefined> {
   try {
     const db = getDb();
-    if (!hasTable(db, 'pending_approvals')) return undefined;
-    const approval = getPendingApproval(questionId);
+    if (!(await hasTable(db, 'pending_approvals'))) return undefined;
+    const approval = await getPendingApproval(questionId);
     if (!approval?.session_id) return undefined;
-    const session = getSession(approval.session_id);
+    const session = await getSession(approval.session_id);
     if (!session?.messaging_group_id) return undefined;
-    const mg = getMessagingGroup(session.messaging_group_id);
+    const mg = await getMessagingGroup(session.messaging_group_id);
     if (!mg || mg.channel_type !== CHANNEL_TYPE) return undefined;
-    const agent = getAgentGroup(session.agent_group_id);
+    const agent = await getAgentGroup(session.agent_group_id);
     return {
       platformId: mg.platform_id,
       threadId: session.thread_id ?? MAIN_THREAD,
@@ -306,6 +280,11 @@ function resolveApprovalSessionOrigin(questionId: string): ApprovalSessionOrigin
   }
 }
 
+function approverUserIdOf(approval: object): string | null {
+  const value = (approval as { approver_user_id?: unknown }).approver_user_id;
+  return typeof value === 'string' && value ? value : null;
+}
+
 function isInboxDeliveryPlatform(platformId: string): boolean {
   return platformId === WEB_INBOX_PLATFORM_ID || platformId.startsWith(`${WEB_INBOX_PLATFORM_ID}:`);
 }
@@ -314,23 +293,25 @@ function isInboxDeliveryPlatform(platformId: string): boolean {
  * Host pending_approvals authz (mirrors nanoclaw approvals response-handler).
  * Non-approval ask_question cards (no pending row) are allowed through.
  */
-export function isAuthorizedApprovalActor(actorUserId: string, questionId: string): boolean {
+export async function isAuthorizedApprovalActor(actorUserId: string, questionId: string): Promise<boolean> {
   try {
     const db = getDb();
-    if (!hasTable(db, 'pending_approvals')) return true;
-    const approval = getPendingApproval(questionId);
+    if (!(await hasTable(db, 'pending_approvals'))) return true;
+    const approval = await getPendingApproval(questionId);
     if (!approval) return true;
 
-    if (approval.approver_user_id) {
-      return actorUserId === approval.approver_user_id;
+    // This fork's pending_approvals has no approver_user_id column; when the
+    // field is absent we fall through to the owner/admin gates below.
+    const namedApprover = approverUserIdOf(approval);
+    if (namedApprover) {
+      return actorUserId === namedApprover;
     }
 
     const agentGroupId =
-      approval.agent_group_id ??
-      (approval.session_id ? getSession(approval.session_id)?.agent_group_id : null);
+      approval.agent_group_id ?? (approval.session_id ? (await getSession(approval.session_id))?.agent_group_id : null);
 
     if (!agentGroupId) {
-      return isOwner(actorUserId) || isGlobalAdmin(actorUserId);
+      return (await isOwner(actorUserId)) || (await isGlobalAdmin(actorUserId));
     }
 
     return hasAdminPrivilege(actorUserId, agentGroupId);
@@ -345,16 +326,13 @@ export function isAuthorizedApprovalActor(actorUserId: string, questionId: strin
  * room belongs to the named approver (public). Local mode keeps prior behavior.
  * Exported for unit tests.
  */
-export function shouldMirrorApprovalToOrigin(
+export async function shouldMirrorApprovalToOrigin(
   origin: ApprovalSessionOrigin,
   questionId: string,
   deliveryPlatformId: string,
   publicMode: boolean,
-): boolean {
-  if (
-    origin.platformId === WEB_INBOX_PLATFORM_ID ||
-    origin.platformId === deliveryPlatformId
-  ) {
+): Promise<boolean> {
+  if (origin.platformId === WEB_INBOX_PLATFORM_ID || origin.platformId === deliveryPlatformId) {
     return false;
   }
 
@@ -362,18 +340,19 @@ export function shouldMirrorApprovalToOrigin(
 
   try {
     const db = getDb();
-    if (!hasTable(db, 'pending_approvals')) return false;
-    const approval = getPendingApproval(questionId);
+    if (!(await hasTable(db, 'pending_approvals'))) return false;
+    const approval = await getPendingApproval(questionId);
     const originOwner = ownerUserIdFromPhysical(origin.platformId);
     if (originOwner === null) return false;
     // Missing approval record OR null approver_user_id (create_agent / install):
     // still mirror into the requesting room when that room's owner can authorize.
     // (Previously only null approver was intended; missing records are rare on this
     // internal path and use the same owner/admin gate.)
-    if (!approval?.approver_user_id) {
-      return isOwner(originOwner) || isGlobalAdmin(originOwner);
+    const namedApprover = approval ? approverUserIdOf(approval) : null;
+    if (!namedApprover) {
+      return (await isOwner(originOwner)) || (await isGlobalAdmin(originOwner));
     }
-    return originOwner === approval.approver_user_id;
+    return originOwner === namedApprover;
   } catch (err) {
     log.warn('shouldMirrorApprovalToOrigin failed', { questionId, err });
     return false;
@@ -462,10 +441,7 @@ function validateInboundAttachments(raw: unknown): InboundAttachment[] | { error
   return validated;
 }
 
-function buildAgentFacingAttachment(
-  messageId: string,
-  meta: StoredAttachmentMeta,
-): Record<string, unknown> {
+function buildAgentFacingAttachment(messageId: string, meta: StoredAttachmentMeta): Record<string, unknown> {
   const base: Record<string, unknown> = {
     name: meta.name,
     type: meta.type === 'image' ? 'image' : 'file',
@@ -566,7 +542,6 @@ async function dispatchInbound(platformId: string, threadId: string | null, inbo
   try {
     await routeInbound({
       channelType: CHANNEL_TYPE,
-      instance: CHANNEL_TYPE,
       platformId,
       threadId,
       message: {
@@ -583,8 +558,8 @@ async function dispatchInbound(platformId: string, threadId: string | null, inbo
   }
 }
 
-function lobbyAgentFolders(): { folders: string[]; teamFolder: string | null; agents: AgentNameRef[] } {
-  const agents = getAllAgentGroups().map((a) => ({
+async function lobbyAgentFolders(): Promise<{ folders: string[]; teamFolder: string | null; agents: AgentNameRef[] }> {
+  const agents = (await getAllAgentGroups()).map((a) => ({
     folder: a.folder,
     displayName: a.name,
   }));
@@ -686,7 +661,7 @@ async function dispatchHistoryReplay(
   engagedAfter: readonly string[],
   history: readonly WebchatStoredMessage[],
 ): Promise<void> {
-  const { folders, teamFolder } = lobbyAgentFolders();
+  const { folders, teamFolder } = await lobbyAgentFolders();
   const mentionOpts = { agentFolders: folders, teamFolder };
   const engagedRefs: ImplicitMentionAgent[] = agentRefsForFolders(engagedAfter, allAgents);
 
@@ -788,7 +763,7 @@ function dispatchBackfillForAgent(
   });
 }
 
-function routeLobbyInbound(
+async function routeLobbyInbound(
   platformId: string,
   threadId: string | null,
   threadIdStored: string,
@@ -798,8 +773,8 @@ function routeLobbyInbound(
   webUserId: string,
   userDisplayName: string,
   broadcastEngaged: (agents: string[]) => void,
-): void {
-  const { folders, teamFolder, agents } = lobbyAgentFolders();
+): Promise<void> {
+  const { folders, teamFolder, agents } = await lobbyAgentFolders();
   const mentionOpts = { agentFolders: folders, teamFolder };
   const explicitMentions = mentionedAgentFolders(trimmedText, mentionOpts);
   const priorEngaged = getEngagedAgents(platformId, threadIdStored);
@@ -833,7 +808,7 @@ function routeLobbyInbound(
 
   for (const receiverFolder of engagedAfter) {
     if (newlyEngaged.includes(receiverFolder)) {
-      dispatchBackfillForAgent(
+      void dispatchBackfillForAgent(
         platformId,
         threadId,
         threadIdStored,
@@ -847,9 +822,9 @@ function routeLobbyInbound(
     }
 
     const chainKey = deliveryChainKey(platformId, threadIdStored, receiverFolder);
-    enqueueAgentDelivery(chainKey, async () => {
+    void enqueueAgentDelivery(chainKey, async () => {
       const routing = buildRoutingMetadata(receiverFolder, explicitMentions, implicitMentions, engagedAfter, false);
-      let deliveryText = trimmedText;
+      const deliveryText = trimmedText;
       const routingContent: Record<string, unknown> = {
         ...content,
         text: deliveryText,
@@ -882,14 +857,7 @@ async function fanOutPeerReply(
   outboundContent: unknown,
   threadMessageSeq?: number,
 ): Promise<void> {
-  if (extractSkipPeerFanOut(outboundContent) || looksLikeProviderLimitNotice(outboundText)) {
-    log.debug('Web peer fan-out skipped — provider error / limit notice', {
-      platformId,
-      threadIdStored,
-    });
-    return;
-  }
-  const { agents } = lobbyAgentFolders();
+  const { agents } = await lobbyAgentFolders();
   const engaged = getEngagedAgents(platformId, threadIdStored);
   const senderName = extractSenderName(outboundContent);
   const senderFolder = extractSenderFolder(outboundContent) ?? folderFromSenderName(senderName, agents);
@@ -916,7 +884,7 @@ async function fanOutPeerReply(
   for (const peerFolder of peers) {
     const routing = buildRoutingMetadata(peerFolder, [], [], engaged, true);
     const peerInbound: InboundMessage = {
-      id: `web-peer-${Date.now()}-${peerFolder}-${Math.random().toString(36).slice(2, 6)}`,
+      id: `web-peer-${crypto.randomUUID()}-${peerFolder}`,
       kind: 'chat',
       content: {
         text: outboundText,
@@ -957,13 +925,9 @@ function attachMcpUser(
   }
 }
 
-function readMcpUser(
-  req: http.IncomingMessage,
-  res?: http.ServerResponse,
-): McpAccessTokenUser | undefined {
+function readMcpUser(req: http.IncomingMessage, res?: http.ServerResponse): McpAccessTokenUser | undefined {
   return (
-    (res ? (res as WebchatAuthedResponse).webchatMcpUser : undefined) ??
-    (req as WebchatAuthedRequest).webchatMcpUser
+    (res ? (res as WebchatAuthedResponse).webchatMcpUser : undefined) ?? (req as WebchatAuthedRequest).webchatMcpUser
   );
 }
 
@@ -973,9 +937,51 @@ function parseBearerAuthorization(header: string | undefined): string | null {
   return token || null;
 }
 
+/** Constant-time string compare (hashes both sides so length never short-circuits). */
+function constantTimeEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+/** Request path without the query string, for logs (tokens may travel in `?token=`). */
+function logPath(rawUrl: string | undefined): string {
+  if (!rawUrl) return '/';
+  const q = rawUrl.indexOf('?');
+  return q === -1 ? rawUrl : rawUrl.slice(0, q);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Minimal same-origin consent page; the form POSTs back with the session-bound CSRF token. */
+export function renderMcpConsentPage(consent: McpPendingConsent, formAction: string): string {
+  const client = escapeHtml(consent.clientName ?? consent.clientId);
+  const scopes = consent.scopes.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`).join('');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authorize ${client}</title>
+<style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5}code{word-break:break-all}button{font:inherit;padding:.5rem 1.25rem;margin-right:.5rem}</style>
+</head><body>
+<h1>Authorize ${client}?</h1>
+<p><strong>${client}</strong> wants to access NanoClaw Web Chat as <strong>${escapeHtml(consent.displayName)}</strong> (<code>${escapeHtml(consent.userId)}</code>).</p>
+<p>Client id: <code>${escapeHtml(consent.clientId)}</code><br>Redirect URI: <code>${escapeHtml(consent.redirectUri)}</code></p>
+<p>Requested scopes:</p><ul>${scopes}</ul>
+<form method="post" action="${escapeHtml(formAction)}">
+<input type="hidden" name="id" value="${escapeHtml(consent.id)}">
+<input type="hidden" name="csrf" value="${escapeHtml(consent.csrfToken)}">
+<button type="submit" name="action" value="approve">Approve</button>
+<button type="submit" name="action" value="deny">Deny</button>
+</form>
+</body></html>`;
+}
+
 function internalApiBase(port: number, bindAddress?: string): string {
-  const host =
-    bindAddress === '0.0.0.0' || bindAddress === '::' || !bindAddress ? '127.0.0.1' : bindAddress;
+  const host = bindAddress === '0.0.0.0' || bindAddress === '::' || !bindAddress ? '127.0.0.1' : bindAddress;
   return `http://${host}:${port}`;
 }
 
@@ -1048,22 +1054,47 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
         }
       }
       if (isPublicAuthPath(url.pathname) && isPublicAuthExemptPath(url.pathname)) return true;
-      if (resolveSessionUser(opts.publicAuth!, req) != null) return true;
+      // Public mode: only browser sessions and MCP access tokens. The static
+      // WEBCHAT_SECRET is never accepted here — it is a local-mode credential.
+      return resolveSessionUser(opts.publicAuth!, req) != null;
     }
 
-    if (bearerHeader === `Bearer ${opts.authToken}`) return true;
+    if (bearer !== null && constantTimeEqual(bearer, opts.authToken)) return true;
     // Browser img/fetch cannot set Authorization; ?token= is accepted for /api/ws and
     // /api/attachments (weaker — may appear in logs/history/referrer).
     if (url.pathname === '/api/ws' || url.pathname.startsWith('/api/attachments/')) {
       const q = url.searchParams.get('token');
-      if (q === opts.authToken) return true;
-    }
-
-    if (isPublicMode()) {
-      return false;
+      if (q !== null && constantTimeEqual(q, opts.authToken)) return true;
     }
 
     return false;
+  }
+
+  /**
+   * WebSocket upgrade origin check. Browsers always send Origin on WS upgrades;
+   * a mismatch means a cross-site page is trying to ride the session cookie.
+   * Non-browser clients (no Origin) are left to checkAuth.
+   */
+  function wsOriginAllowed(originHeader: string | undefined): boolean {
+    if (originHeader === undefined) return true;
+    let origin: URL;
+    try {
+      origin = new URL(originHeader);
+    } catch {
+      return false;
+    }
+    if (isPublicMode() && opts.publicBaseUrl) {
+      let expected: URL;
+      try {
+        expected = new URL(opts.publicBaseUrl);
+      } catch {
+        return false;
+      }
+      return origin.origin === expected.origin;
+    }
+    // Local (or public without a base URL): loopback host on this adapter's port.
+    const port = origin.port || (origin.protocol === 'https:' ? '443' : '80');
+    return isLoopbackHost(origin.hostname) && port === String(opts.port);
   }
 
   function broadcast(event: unknown): void {
@@ -1096,10 +1127,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     return { ...msg, platformId: toLogicalPlatformId(msg.platformId) };
   }
 
-  function wsEventForClient(
-    event: Record<string, unknown>,
-    storagePlatformId?: string,
-  ): Record<string, unknown> {
+  function wsEventForClient(event: Record<string, unknown>, storagePlatformId?: string): Record<string, unknown> {
     if (!isPublicMode()) return event;
     const owner = storagePlatformId ? ownerUserIdFromPhysical(storagePlatformId) : null;
     if (owner) return { ...event, forUserId: owner };
@@ -1111,18 +1139,14 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     storedAttachments?: StoredAttachmentMeta[],
   ): WebchatStoredMessage {
     const stored =
-      storedAttachments !== undefined
-        ? persistStoredAttachments(msg, storedAttachments)
-        : appendMessage(msg);
+      storedAttachments !== undefined ? persistStoredAttachments(msg, storedAttachments) : appendMessage(msg);
     const clientMsg = messageForClient(stored);
     broadcast(wsEventForClient({ type: 'message', message: clientMsg }, stored.platformId));
     return stored;
   }
 
   function broadcastMessageUpdate(message: WebchatStoredMessage): void {
-    broadcast(
-      wsEventForClient({ type: 'message_update', message: messageForClient(message) }, message.platformId),
-    );
+    broadcast(wsEventForClient({ type: 'message_update', message: messageForClient(message) }, message.platformId));
   }
 
   function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<string> {
@@ -1263,7 +1287,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     }
 
     const threadId = threadIdRaw === MAIN_THREAD ? null : threadIdRaw;
-    const id = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const id = `web-${crypto.randomUUID()}`;
     const timestamp = new Date().toISOString();
     const isGroup = logicalPlatformId === WEB_LOBBY_PLATFORM_ID;
 
@@ -1382,7 +1406,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       const threadIdStored = threadId ?? MAIN_THREAD;
       const trimmedText = text.trim();
       if (isGroup) {
-        routeLobbyInbound(
+        await routeLobbyInbound(
           storagePlatformId,
           threadId,
           threadIdStored,
@@ -1443,6 +1467,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     threadId: string,
     req: http.IncomingMessage,
     res: http.ServerResponse,
+    ownerId: string,
   ): Promise<void> {
     let body: string;
     try {
@@ -1486,6 +1511,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       },
       platformId,
       threadId,
+      ownerId,
     );
     if (!result.ok) {
       json(res, result.status, { error: result.error });
@@ -1554,7 +1580,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       return;
     }
 
-    if (!isAuthorizedApprovalActor(actorUserId, questionId)) {
+    if (!(await isAuthorizedApprovalActor(actorUserId, questionId))) {
       log.warn('Ignoring unauthorized webchat approval click', { questionId, actorUserId });
       json(res, 403, { error: 'not authorized' });
       return;
@@ -1591,6 +1617,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     platformId: string,
     req: http.IncomingMessage,
     res: http.ServerResponse,
+    createdBy: string,
   ): Promise<void> {
     let title = 'Thread';
     try {
@@ -1605,7 +1632,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       json(res, 400, { error: 'Invalid JSON' });
       return;
     }
-    const thread = createThread(platformId, title);
+    const thread = createThread(platformId, title, createdBy);
     json(res, 200, thread);
   }
 
@@ -1638,16 +1665,33 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     json(res, 200, { id: threadId, title });
   }
 
-  function handleDeleteThread(platformId: string, threadId: string, res: http.ServerResponse): void {
+  /** Shared-room (lobby) threads may only be deleted by their creator or an owner. */
+  async function canDeleteThread(platformId: string, threadId: string, actorUserId: string): Promise<boolean> {
+    if (!isPublicMode() || platformId !== WEB_LOBBY_PLATFORM_ID) return true;
+    const creator = getThreadCreator(platformId, threadId);
+    if (creator !== null && creator === actorUserId) return true;
+    return isOwner(actorUserId);
+  }
+
+  async function handleDeleteThread(
+    platformId: string,
+    threadId: string,
+    res: http.ServerResponse,
+    actorUserId: string,
+  ): Promise<void> {
     if (threadId === MAIN_THREAD) {
       json(res, 400, { error: 'cannot delete main thread' });
       return;
     }
+    if (!(await canDeleteThread(platformId, threadId, actorUserId))) {
+      json(res, 403, { error: 'only the thread creator or an owner can delete this thread' });
+      return;
+    }
     deleteThreadData(platformId, threadId);
     try {
-      const mg = getMessagingGroupByPlatform(CHANNEL_TYPE, platformId);
+      const mg = await getMessagingGroupByPlatform(CHANNEL_TYPE, platformId);
       if (mg) {
-        cleanupAgentSessionsForThread(mg.id, threadId);
+        await cleanupAgentSessionsForThread(mg.id, threadId);
       }
     } catch (err) {
       log.error('Web thread session cleanup failed', { err, platformId, threadId });
@@ -1655,13 +1699,76 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     json(res, 200, { ok: true });
   }
 
-  function serveAttachment(messageId: string, storageName: string, req: http.IncomingMessage, res: http.ServerResponse): void {
+  function serveAttachment(
+    messageId: string,
+    storageName: string,
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): void {
     const filePath = getMessageAttachmentPath(messageId, storageName);
     if (!filePath) {
       res.writeHead(404).end();
       return;
     }
     serveAttachmentFile(filePath, storageName, req, res);
+  }
+
+  function html(res: http.ServerResponse, status: number, body: string): void {
+    res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(body);
+  }
+
+  function consentFormAction(): string {
+    const prefix = (opts.publicPath ?? '').replace(/\/+$/, '');
+    return `${prefix}${MCP_CONSENT_PATH}`;
+  }
+
+  /** GET renders the consent page; POST (same-origin form + CSRF) issues or denies the code. */
+  async function handleMcpConsent(req: http.IncomingMessage, url: URL, res: http.ServerResponse): Promise<void> {
+    const backend = mcpOAuthBackend!;
+    if (req.method === 'GET') {
+      const consentId = url.searchParams.get('id') ?? '';
+      if (!resolveSessionUser(opts.publicAuth!, req)) {
+        const returnTo = new URL(
+          `${consentFormAction()}?id=${encodeURIComponent(consentId)}`,
+          `${opts.publicBaseUrl}/`,
+        );
+        res.writeHead(302, { Location: `/?returnTo=${encodeURIComponent(returnTo.toString())}` });
+        res.end();
+        return;
+      }
+      const consent = backend.getPendingConsent(req, consentId);
+      if (!consent) {
+        html(res, 400, '<!DOCTYPE html><html><body><h1>Unknown or expired authorization request</h1></body></html>');
+        return;
+      }
+      html(res, 200, renderMcpConsentPage(consent, consentFormAction()));
+      return;
+    }
+    if (req.method === 'POST') {
+      let body: string;
+      try {
+        body = await readBody(req, 4096);
+      } catch {
+        json(res, 413, { error: 'payload too large' });
+        return;
+      }
+      const form = new URLSearchParams(body);
+      const decision = backend.decideConsent(
+        req,
+        form.get('id') ?? '',
+        form.get('csrf') ?? '',
+        form.get('action') === 'approve',
+      );
+      if (decision.type === 'redirect') {
+        res.writeHead(302, { Location: decision.location, 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      html(res, decision.status, `<!DOCTYPE html><html><body><h1>${escapeHtml(decision.message)}</h1></body></html>`);
+      return;
+    }
+    res.writeHead(405, { Allow: 'GET, POST' }).end();
   }
 
   return {
@@ -1672,6 +1779,8 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     async setup(config: ChannelSetup): Promise<void> {
       setupConfig = config;
       ensureWebchatSchema();
+      // Staged uploads are tracked in memory only; anything left on disk is orphaned.
+      sweepUploadStaging();
       if (isPublicMode()) ensureWebchatAuthSchema();
 
       if (isPublicMode() && opts.publicBaseUrl && opts.publicAuth) {
@@ -1681,6 +1790,8 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
           publicBaseUrl: opts.publicBaseUrl,
           resourceServerUrl: mcpResourceServerUrl,
           tokenTtlSeconds: opts.mcpTokenTtlSeconds,
+          allowDynamicClientRegistration: opts.mcpAllowDynamicClientRegistration === true,
+          consentPath: consentFormAction(),
         });
         if (opts.mcpHttpEnabled) {
           try {
@@ -1709,12 +1820,24 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
         throw err;
       }
 
-      server = http.createServer(async (req, res) => {
+      const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         try {
           const url = new URL(req.url ?? '/', `http://127.0.0.1:${opts.port}`);
 
           if (mcpHttpListener && mcpHttpPathMatches?.(url.pathname)) {
+            if (url.pathname === '/register' && !mcpOAuthBackend?.allowDynamicClientRegistration) {
+              json(res, 403, {
+                error: 'access_denied',
+                error_description: 'Dynamic client registration is disabled (WEBCHAT_MCP_ALLOW_DCR)',
+              });
+              return;
+            }
             mcpHttpListener(req, res);
+            return;
+          }
+
+          if (mcpOAuthBackend && isPublicMode() && url.pathname === MCP_CONSENT_PATH) {
+            await handleMcpConsent(req, url, res);
             return;
           }
 
@@ -1747,31 +1870,10 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
             if (req.method === 'GET' && url.pathname === '/api/bootstrap') {
               // Heal lobby + this user's DMs only (CLI create, etc.). Full syncWebchatWirings
               // walks every web user in public mode — too expensive for page load.
-              healWebchatWiringsForUser(requestUser.userId, requestUser.displayName);
+              await healWebchatWiringsForUser(requestUser.userId, requestUser.displayName);
               json(res, 200, {
-                ...buildWebchatBootstrap(requestUser.userId, requestUser.displayName),
+                ...(await buildWebchatBootstrap(requestUser.userId, requestUser.displayName)),
                 authMode: opts.authMode,
-              });
-              return;
-            }
-
-            const activityMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/threads\/([^/]+)\/activity$/);
-            if (activityMatch && req.method === 'GET') {
-              const logicalPlatformId = decodeURIComponent(activityMatch[1]!);
-              const activityThreadId = decodeURIComponent(activityMatch[2]!);
-              const storagePlatformId = tryResolveStoragePlatformId(
-                logicalPlatformId,
-                requestUser.userId,
-                res,
-              );
-              if (storagePlatformId === undefined) return;
-              // Activity payloads are agent-status (name/folder/summary) — no
-              // storage-only fields to redact in public mode beyond platformId remap.
-              const events = getActivityEvents(storagePlatformId, activityThreadId);
-              json(res, 200, {
-                platformId: isPublicMode() ? toLogicalPlatformId(storagePlatformId) : storagePlatformId,
-                threadId: activityThreadId,
-                events,
               });
               return;
             }
@@ -1780,6 +1882,14 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
             if (attMatch && req.method === 'GET') {
               const messageId = decodeURIComponent(attMatch[1]!);
               const storageName = decodeURIComponent(attMatch[2]!);
+              // Same room gate as /api/rooms: the requester must have access to the
+              // room the message lives in (lobby is shared; DMs/inbox are per-user).
+              const location = getMessageLocation(messageId);
+              if (!location) {
+                res.writeHead(404).end();
+                return;
+              }
+              if (tryResolveStoragePlatformId(location.platformId, requestUser.userId, res) === undefined) return;
               serveAttachment(messageId, storageName, req, res);
               return;
             }
@@ -1787,13 +1897,9 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
             const threadsMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/threads$/);
             if (threadsMatch && req.method === 'POST') {
               const logicalPlatformId = decodeURIComponent(threadsMatch[1]!);
-              const storagePlatformId = tryResolveStoragePlatformId(
-                logicalPlatformId,
-                requestUser.userId,
-                res,
-              );
+              const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
-              await handleCreateThread(storagePlatformId, req, res);
+              await handleCreateThread(storagePlatformId, req, res, requestUser.userId);
               return;
             }
 
@@ -1801,18 +1907,14 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
             if (threadMatch) {
               const logicalPlatformId = decodeURIComponent(threadMatch[1]!);
               const threadId = decodeURIComponent(threadMatch[2]!);
-              const storagePlatformId = tryResolveStoragePlatformId(
-                logicalPlatformId,
-                requestUser.userId,
-                res,
-              );
+              const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
               if (req.method === 'PATCH') {
                 await handlePatchThread(storagePlatformId, threadId, req, res);
                 return;
               }
               if (req.method === 'DELETE') {
-                handleDeleteThread(storagePlatformId, threadId, res);
+                await handleDeleteThread(storagePlatformId, threadId, res, requestUser.userId);
                 return;
               }
             }
@@ -1821,48 +1923,29 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
             if (msgMatch) {
               const logicalPlatformId = decodeURIComponent(msgMatch[1]!);
               const threadId = decodeURIComponent(msgMatch[2]!);
-              const storagePlatformId = tryResolveStoragePlatformId(
-                logicalPlatformId,
-                requestUser.userId,
-                res,
-              );
+              const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
               if (req.method === 'GET') {
                 const since = parseInt(url.searchParams.get('since') ?? '0', 10);
                 const messages = getMessages(storagePlatformId, threadId, since).map(messageForClient);
                 const engagedAgents =
-                  logicalPlatformId === WEB_LOBBY_PLATFORM_ID
-                    ? getEngagedAgents(storagePlatformId, threadId)
-                    : [];
+                  logicalPlatformId === WEB_LOBBY_PLATFORM_ID ? getEngagedAgents(storagePlatformId, threadId) : [];
                 json(res, 200, { messages, engagedAgents });
                 return;
               }
               if (req.method === 'POST') {
-                await handlePostMessage(
-                  logicalPlatformId,
-                  storagePlatformId,
-                  threadId,
-                  req,
-                  res,
-                  requestUser,
-                );
+                await handlePostMessage(logicalPlatformId, storagePlatformId, threadId, req, res, requestUser);
                 return;
               }
             }
 
-            const uploadChunkMatch = url.pathname.match(
-              /^\/api\/rooms\/([^/]+)\/threads\/([^/]+)\/uploads\/chunk$/,
-            );
+            const uploadChunkMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/threads\/([^/]+)\/uploads\/chunk$/);
             if (uploadChunkMatch && req.method === 'POST') {
               const logicalPlatformId = decodeURIComponent(uploadChunkMatch[1]!);
               const threadId = decodeURIComponent(uploadChunkMatch[2]!);
-              const storagePlatformId = tryResolveStoragePlatformId(
-                logicalPlatformId,
-                requestUser.userId,
-                res,
-              );
+              const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
-              await handleChunkUpload(storagePlatformId, threadId, req, res);
+              await handleChunkUpload(storagePlatformId, threadId, req, res, requestUser.userId);
               return;
             }
 
@@ -1870,11 +1953,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
             if (uploadMatch && req.method === 'POST') {
               const logicalPlatformId = decodeURIComponent(uploadMatch[1]!);
               const threadId = decodeURIComponent(uploadMatch[2]!);
-              const storagePlatformId = tryResolveStoragePlatformId(
-                logicalPlatformId,
-                requestUser.userId,
-                res,
-              );
+              const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
               await handleMultipartUpload(storagePlatformId, threadId, req, res);
               return;
@@ -1884,11 +1963,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
             if (actionMatch && req.method === 'POST') {
               const logicalPlatformId = decodeURIComponent(actionMatch[1]!);
               const threadId = decodeURIComponent(actionMatch[2]!);
-              const storagePlatformId = tryResolveStoragePlatformId(
-                logicalPlatformId,
-                requestUser.userId,
-                res,
-              );
+              const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
               await handlePostAction(storagePlatformId, threadId, req, res, requestUser.userId);
               return;
@@ -1903,11 +1978,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
                 json(res, 400, { error: 'engaged agents only apply to lobby' });
                 return;
               }
-              const storagePlatformId = tryResolveStoragePlatformId(
-                logicalPlatformId,
-                requestUser.userId,
-                res,
-              );
+              const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
               const agents = removeEngagedAgent(storagePlatformId, threadId, agentFolder);
               broadcast(
@@ -1935,12 +2006,15 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
 
           res.writeHead(404).end();
         } catch (err) {
-          log.error('Web channel request failed', { err, path: req.url });
+          log.error('Web channel request failed', { err, path: logPath(req.url) });
           /* v8 ignore if -- streaming handlers may have already started the response */
           if (!res.headersSent) {
             json(res, 500, { error: 'Internal server error' });
           }
         }
+      };
+      server = http.createServer((req, res) => {
+        void handleRequest(req, res);
       });
 
       wss = new WebSocketServer({ noServer: true });
@@ -1948,6 +2022,11 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       server.on('upgrade', (req, socket, head) => {
         const url = new URL(req.url ?? '/', `http://127.0.0.1:${opts.port}`);
         if (url.pathname !== '/api/ws') {
+          socket.destroy();
+          return;
+        }
+        if (!wsOriginAllowed(req.headers.origin)) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
           socket.destroy();
           return;
         }
@@ -1976,11 +2055,11 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
         });
       });
 
-      setWebchatBootstrapBroadcaster(() => {
+      setWebchatBootstrapBroadcaster(async () => {
         for (const client of wsClients) {
           if (client.ws.readyState !== WebSocket.OPEN) continue;
           const userId = client.userId ?? opts.userId;
-          const bootstrap = bootstrapPayloadForUser(userId);
+          const bootstrap = await bootstrapPayloadForUser(userId);
           // Per-client payload: forUserId matches the recipient, so no extra filter needed.
           const event: Record<string, unknown> = { type: 'bootstrap', bootstrap };
           if (isPublicMode()) {
@@ -2026,10 +2105,10 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
         const card = buildAskQuestionCard(askQuestion);
         const text = cardFallbackText(card.title, card.question);
         const origin = isInboxDeliveryPlatform(platformId)
-          ? resolveApprovalSessionOrigin(askQuestion.questionId)
+          ? await resolveApprovalSessionOrigin(askQuestion.questionId)
           : undefined;
         const senderName = extractSenderName(message.content) ?? origin?.agentName;
-        const id = `web-out-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const id = `web-out-${crypto.randomUUID()}`;
         persistAndBroadcast({
           id,
           direction: 'outbound',
@@ -2043,9 +2122,9 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
 
         if (
           origin &&
-          shouldMirrorApprovalToOrigin(origin, askQuestion.questionId, platformId, isPublicMode())
+          (await shouldMirrorApprovalToOrigin(origin, askQuestion.questionId, platformId, isPublicMode()))
         ) {
-          const mirrorId = `web-out-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          const mirrorId = `web-out-${crypto.randomUUID()}`;
           persistAndBroadcast({
             id: mirrorId,
             direction: 'outbound',
@@ -2065,7 +2144,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       const attachments =
         message.files?.map(outboundFileToAttachment).filter((a): a is WebChatAttachment => a !== null) ?? [];
       if (!text.trim() && attachments.length === 0) return undefined;
-      const id = `web-out-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const id = `web-out-${crypto.randomUUID()}`;
       const senderName = extractSenderName(message.content);
       const stored = persistAndBroadcast({
         id,
@@ -2107,77 +2186,12 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     },
 
     async setTyping(platformId: string, threadId: string | null): Promise<void> {
-      const tid = threadId ?? MAIN_THREAD;
-      const agents = resolveTypingAgentFolders(platformId, tid);
-      broadcast(
-        wsEventForClient(
-          {
-            type: 'typing',
-            platformId: isPublicMode() ? toLogicalPlatformId(platformId) : platformId,
-            threadId: tid,
-            ...(agents.length > 0 ? { agents } : {}),
-          },
-          platformId,
-        ),
-      );
+      broadcast({
+        type: 'typing',
+        platformId,
+        threadId: threadId ?? MAIN_THREAD,
+      });
     },
-
-    async publishActivity(
-      platformId: string,
-      threadId: string | null,
-      event: StoredActivityEvent,
-    ): Promise<void> {
-      const tid = threadId ?? MAIN_THREAD;
-      // Keepalives are ephemeral typing pulses — don't persist (avoids
-      // reconnect ghosts of "Working" after the turn already finished).
-      if (!event.keepalive) {
-        appendActivityEvent(platformId, tid, event);
-      }
-      broadcast(
-        wsEventForClient(
-          {
-            type: 'activity',
-            platformId: isPublicMode() ? toLogicalPlatformId(platformId) : platformId,
-            threadId: tid,
-            event,
-          },
-          platformId,
-        ),
-      );
-    },
-
-    async clearActivity(
-      platformId: string,
-      threadId: string | null,
-      turnId?: string,
-    ): Promise<void> {
-      const tid = threadId ?? MAIN_THREAD;
-      // turnId set → clear that turn; omitted → clear all activity for the room.
-      clearActivityTurn(platformId, tid, turnId);
-      broadcast(
-        wsEventForClient(
-          {
-            type: 'activity_clear',
-            platformId: isPublicMode() ? toLogicalPlatformId(platformId) : platformId,
-            threadId: tid,
-            turnId,
-          },
-          platformId,
-        ),
-      );
-    },
-    // Duck-typed for nanoclaw-agenttrace — not on ChannelAdapter until trunk adopts it.
-  } as ChannelAdapter & {
-    publishActivity: (
-      platformId: string,
-      threadId: string | null,
-      event: StoredActivityEvent,
-    ) => Promise<void>;
-    clearActivity: (
-      platformId: string,
-      threadId: string | null,
-      turnId?: string,
-    ) => Promise<void>;
   };
 }
 
@@ -2206,6 +2220,7 @@ registerChannelAdapter('web', {
       displayName: cfg.localDisplayName,
       publicAuth: cfg.public,
       mcpHttpEnabled: cfg.mcpHttpEnabled,
+      mcpAllowDynamicClientRegistration: cfg.mcpAllowDynamicClientRegistration,
       publicBaseUrl: cfg.publicBaseUrl,
       mcpTokenTtlSeconds: cfg.mcpTokenTtlSeconds,
     });

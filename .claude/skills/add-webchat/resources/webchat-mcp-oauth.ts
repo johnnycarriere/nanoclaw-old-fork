@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import http from 'http';
 
 import type { PublicAuthConfig } from './webchat-auth-config.js';
-import { resolveSessionUser } from './webchat-auth.js';
+import { resolveSessionRecord } from './webchat-auth.js';
 import { ensureWebchatAuthSchema, getAuthDbInternal } from './webchat-auth-sessions.js';
 
 /** Default MCP access-token lifetime (24h). Override with WEBCHAT_MCP_TOKEN_TTL_SECONDS. */
@@ -18,6 +18,10 @@ export const MCP_DEFAULT_SCOPE = 'mcp:tools';
 export const MCP_OAUTH_CLIENT_TTL_SECONDS = 30 * 24 * 60 * 60;
 export const MCP_JWT_TYP = 'MCP+JWT';
 export const MCP_JWT_ALG = 'HS256';
+/** Same-origin consent interstitial served by the web adapter (outside the MCP SDK router). */
+export const MCP_CONSENT_PATH = '/mcp/consent';
+/** Pending consent requests expire after this (ms). */
+export const MCP_CONSENT_TTL_MS = 10 * 60 * 1000;
 
 export interface McpAccessTokenUser {
   userId: string;
@@ -67,6 +71,25 @@ export interface WebchatMcpOAuthConfig {
   publicBaseUrl: string;
   resourceServerUrl: string;
   tokenTtlSeconds?: number;
+  /** Expose `clientsStore.registerClient` (OAuth dynamic client registration). Default false. */
+  allowDynamicClientRegistration?: boolean;
+  /** Path of the consent page (prefixed with the public path when mounted under one). */
+  consentPath?: string;
+}
+
+/** A pending authorization awaiting the user's explicit consent on the interstitial. */
+export interface McpPendingConsent {
+  id: string;
+  clientId: string;
+  clientName?: string;
+  userId: string;
+  displayName: string;
+  redirectUri: string;
+  scopes: string[];
+  resource: string;
+  state?: string;
+  /** CSRF token bound to this consent + the browser session; embed in the consent form. */
+  csrfToken: string;
 }
 
 interface JwtHeader {
@@ -102,10 +125,7 @@ function verifyJwt(token: string, secret: string, iss: string, aud: string): Jwt
   const [headerB64, payloadB64, sig] = parts;
   if (!headerB64 || !payloadB64 || !sig) return null;
 
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(`${headerB64}.${payloadB64}`)
-    .digest('base64url');
+  const expected = crypto.createHmac('sha256', secret).update(`${headerB64}.${payloadB64}`).digest('base64url');
   if (sig.length !== expected.length) return null;
   if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
 
@@ -193,6 +213,40 @@ function purgeExpiredMcpCodes(): void {
   const db = getAuthDbInternal();
   const cutoff = Date.now() - 10 * 60 * 1000;
   db.prepare('DELETE FROM web_mcp_oauth_codes WHERE created_at_ms < ?').run(cutoff);
+  db.prepare('DELETE FROM web_mcp_oauth_consents WHERE created_at_ms < ?').run(Date.now() - MCP_CONSENT_TTL_MS);
+}
+
+/** CSRF token = HMAC(sessionSecret, sessionId:consentId:nonce) — only the owning browser session can approve. */
+function consentCsrfToken(secret: string, sessionId: string, consentId: string, nonce: string): string {
+  return crypto.createHmac('sha256', secret).update(`${sessionId}:${consentId}:${nonce}`).digest('base64url');
+}
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+interface ConsentRow {
+  id: string;
+  client_id: string;
+  client_name: string | null;
+  session_id: string;
+  user_id: string;
+  display_name: string;
+  code_challenge: string;
+  redirect_uri: string;
+  scopes_json: string;
+  resource: string | null;
+  state: string | null;
+  csrf_nonce: string;
+  created_at_ms: number;
+}
+
+function loadConsentRow(id: string): ConsentRow | undefined {
+  purgeExpiredMcpCodes();
+  const db = getAuthDbInternal();
+  return db.prepare('SELECT * FROM web_mcp_oauth_consents WHERE id = ?').get(id) as ConsentRow | undefined;
 }
 
 /** Drop unused dynamic clients after MCP_OAUTH_CLIENT_TTL_SECONDS. */
@@ -224,9 +278,7 @@ function rowToClient(row: {
     client_name: row.client_name ?? undefined,
     token_endpoint_auth_method: row.token_endpoint_auth_method ?? undefined,
     grant_types: row.grant_types_json ? (JSON.parse(row.grant_types_json) as string[]) : undefined,
-    response_types: row.response_types_json
-      ? (JSON.parse(row.response_types_json) as string[])
-      : undefined,
+    response_types: row.response_types_json ? (JSON.parse(row.response_types_json) as string[]) : undefined,
     scope: row.scope ?? undefined,
   };
 }
@@ -260,7 +312,48 @@ export function createWebchatMcpOAuthBackend(config: WebchatMcpOAuthConfig) {
   const tokenTtlSeconds = config.tokenTtlSeconds ?? MCP_ACCESS_TOKEN_TTL_SECONDS;
   const issuer = config.publicBaseUrl.replace(/\/$/, '');
 
-  const clientsStore = {
+  const allowDcr = config.allowDynamicClientRegistration === true;
+  const consentPath = config.consentPath ?? MCP_CONSENT_PATH;
+
+  async function registerClient(
+    client: Omit<McpOAuthClientRecord, 'client_id'> & { client_id?: string },
+  ): Promise<McpOAuthClientRecord> {
+    purgeStaleMcpOAuthClients();
+    const db = getAuthDbInternal();
+    const clientId = client.client_id ?? crypto.randomUUID();
+    const issuedAt = client.client_id_issued_at ?? Math.floor(Date.now() / 1000);
+    const record: McpOAuthClientRecord = {
+      ...client,
+      client_id: clientId,
+      client_id_issued_at: issuedAt,
+      redirect_uris: client.redirect_uris.map(String),
+    };
+    db.prepare(
+      `INSERT INTO web_mcp_oauth_clients
+       (client_id, client_secret, client_id_issued_at, client_secret_expires_at,
+        redirect_uris_json, client_name, token_endpoint_auth_method,
+        grant_types_json, response_types_json, scope)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      record.client_id,
+      record.client_secret ?? null,
+      record.client_id_issued_at!,
+      record.client_secret_expires_at ?? null,
+      JSON.stringify(record.redirect_uris),
+      record.client_name ?? null,
+      record.token_endpoint_auth_method ?? null,
+      record.grant_types ? JSON.stringify(record.grant_types) : null,
+      record.response_types ? JSON.stringify(record.response_types) : null,
+      record.scope ?? null,
+    );
+    return record;
+  }
+
+  const clientsStore: {
+    getClient(clientId: string): Promise<McpOAuthClientRecord | undefined>;
+    /** Only present when dynamic client registration is allowed (WEBCHAT_MCP_ALLOW_DCR=true). */
+    registerClient?: typeof registerClient;
+  } = {
     async getClient(clientId: string): Promise<McpOAuthClientRecord | undefined> {
       purgeStaleMcpOAuthClients();
       const db = getAuthDbInternal();
@@ -287,57 +380,70 @@ export function createWebchatMcpOAuthBackend(config: WebchatMcpOAuthConfig) {
         | undefined;
       return row ? rowToClient(row) : undefined;
     },
-
-    async registerClient(
-      client: Omit<McpOAuthClientRecord, 'client_id'> & { client_id?: string },
-    ): Promise<McpOAuthClientRecord> {
-      purgeStaleMcpOAuthClients();
-      const db = getAuthDbInternal();
-      const clientId = client.client_id ?? crypto.randomUUID();
-      const issuedAt = client.client_id_issued_at ?? Math.floor(Date.now() / 1000);
-      const record: McpOAuthClientRecord = {
-        ...client,
-        client_id: clientId,
-        client_id_issued_at: issuedAt,
-        redirect_uris: client.redirect_uris.map(String),
-      };
-      db.prepare(
-        `INSERT INTO web_mcp_oauth_clients
-         (client_id, client_secret, client_id_issued_at, client_secret_expires_at,
-          redirect_uris_json, client_name, token_endpoint_auth_method,
-          grant_types_json, response_types_json, scope)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        record.client_id,
-        record.client_secret ?? null,
-        record.client_id_issued_at!,
-        record.client_secret_expires_at ?? null,
-        JSON.stringify(record.redirect_uris),
-        record.client_name ?? null,
-        record.token_endpoint_auth_method ?? null,
-        record.grant_types ? JSON.stringify(record.grant_types) : null,
-        record.response_types ? JSON.stringify(record.response_types) : null,
-        record.scope ?? null,
-      );
-      return record;
-    },
+    ...(allowDcr ? { registerClient } : {}),
   };
+
+  function issueCode(row: ConsentRow): string {
+    const code = crypto.randomBytes(32).toString('hex');
+    const db = getAuthDbInternal();
+    db.prepare(
+      `INSERT INTO web_mcp_oauth_codes
+       (code, client_id, user_id, display_name, code_challenge, redirect_uri, scopes_json, resource, state, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      code,
+      row.client_id,
+      row.user_id,
+      row.display_name,
+      row.code_challenge,
+      row.redirect_uri,
+      row.scopes_json,
+      row.resource ?? config.resourceServerUrl,
+      row.state,
+      Date.now(),
+    );
+    return code;
+  }
+
+  function consentFromRow(row: ConsentRow): McpPendingConsent {
+    return {
+      id: row.id,
+      clientId: row.client_id,
+      clientName: row.client_name ?? undefined,
+      userId: row.user_id,
+      displayName: row.display_name,
+      redirectUri: row.redirect_uri,
+      scopes: JSON.parse(row.scopes_json) as string[],
+      resource: row.resource ?? config.resourceServerUrl,
+      state: row.state ?? undefined,
+      csrfToken: consentCsrfToken(config.publicAuth.sessionSecret, row.session_id, row.id, row.csrf_nonce),
+    };
+  }
 
   return {
     clientsStore,
     config,
+    /** Operator/test path: always available regardless of the DCR setting. */
+    registerClient,
+    allowDynamicClientRegistration: allowDcr,
+    consentPath,
 
     buildAuthorizeReturnUrl(req: http.IncomingMessage & { originalUrl?: string | null }): string {
       const path = req.originalUrl ?? req.url ?? '/authorize';
       return new URL(path, `${config.publicBaseUrl}/`).toString();
     },
 
+    /**
+     * SDK authorize hook. Never issues a code directly: records a pending consent
+     * and redirects to the same-origin consent page, which issues the code only
+     * on a CSRF-checked POST from the logged-in browser.
+     */
     authorize(
       req: http.IncomingMessage,
       client: McpOAuthClientRecord,
       params: McpAuthorizationParams,
     ): { type: 'redirect'; location: string } {
-      const session = resolveSessionUser(config.publicAuth, req);
+      const session = resolveSessionRecord(config.publicAuth, req);
       if (!session) {
         const returnTo = this.buildAuthorizeReturnUrl(req);
         return {
@@ -354,16 +460,19 @@ export function createWebchatMcpOAuthBackend(config: WebchatMcpOAuthConfig) {
         throw new Error('Invalid resource');
       }
 
-      const code = crypto.randomBytes(32).toString('hex');
       purgeExpiredMcpCodes();
+      const consentId = crypto.randomBytes(24).toString('base64url');
       const db = getAuthDbInternal();
       db.prepare(
-        `INSERT INTO web_mcp_oauth_codes
-         (code, client_id, user_id, display_name, code_challenge, redirect_uri, scopes_json, resource, state, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO web_mcp_oauth_consents
+         (id, client_id, client_name, session_id, user_id, display_name, code_challenge, redirect_uri,
+          scopes_json, resource, state, csrf_nonce, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
-        code,
+        consentId,
         client.client_id,
+        client.client_name ?? null,
+        session.sessionId,
         session.userId,
         session.displayName,
         params.codeChallenge,
@@ -371,21 +480,63 @@ export function createWebchatMcpOAuthBackend(config: WebchatMcpOAuthConfig) {
         JSON.stringify(params.scopes.length ? params.scopes : [MCP_DEFAULT_SCOPE]),
         params.resource ?? config.resourceServerUrl,
         params.state ?? null,
+        crypto.randomBytes(16).toString('base64url'),
         Date.now(),
       );
 
-      const target = new URL(params.redirectUri);
-      target.searchParams.set('code', code);
-      if (params.state) target.searchParams.set('state', params.state);
+      return { type: 'redirect', location: `${consentPath}?id=${encodeURIComponent(consentId)}` };
+    },
+
+    /** Load a pending consent for the consent page; null when missing/expired or not this session's. */
+    getPendingConsent(req: http.IncomingMessage, consentId: string): McpPendingConsent | null {
+      const session = resolveSessionRecord(config.publicAuth, req);
+      if (!session) return null;
+      const row = loadConsentRow(consentId);
+      if (!row || row.session_id !== session.sessionId) return null;
+      return consentFromRow(row);
+    },
+
+    /**
+     * Resolve a consent decision from the consent form POST. Approve issues the
+     * authorization code; deny redirects back with `error=access_denied`. Both
+     * require the owning browser session and a matching CSRF token.
+     */
+    decideConsent(
+      req: http.IncomingMessage,
+      consentId: string,
+      csrfToken: string,
+      approve: boolean,
+    ): { type: 'redirect'; location: string } | { type: 'error'; status: number; message: string } {
+      const session = resolveSessionRecord(config.publicAuth, req);
+      if (!session) return { type: 'error', status: 401, message: 'Login required' };
+      const row = loadConsentRow(consentId);
+      if (!row || row.session_id !== session.sessionId) {
+        return { type: 'error', status: 400, message: 'Unknown or expired consent request' };
+      }
+      const expected = consentCsrfToken(config.publicAuth.sessionSecret, session.sessionId, row.id, row.csrf_nonce);
+      if (!csrfToken || !timingSafeStringEqual(csrfToken, expected)) {
+        return { type: 'error', status: 403, message: 'Invalid CSRF token' };
+      }
+      const db = getAuthDbInternal();
+      db.prepare('DELETE FROM web_mcp_oauth_consents WHERE id = ?').run(row.id);
+
+      const target = new URL(row.redirect_uri);
+      if (approve) {
+        target.searchParams.set('code', issueCode(row));
+      } else {
+        target.searchParams.set('error', 'access_denied');
+        target.searchParams.set('error_description', 'The user denied the request');
+      }
+      if (row.state) target.searchParams.set('state', row.state);
       return { type: 'redirect', location: target.toString() };
     },
 
     async challengeForAuthorizationCode(_client: McpOAuthClientRecord, code: string): Promise<string> {
       purgeExpiredMcpCodes();
       const db = getAuthDbInternal();
-      const row = db
-        .prepare(`SELECT code_challenge FROM web_mcp_oauth_codes WHERE code = ?`)
-        .get(code) as { code_challenge: string } | undefined;
+      const row = db.prepare(`SELECT code_challenge FROM web_mcp_oauth_codes WHERE code = ?`).get(code) as
+        | { code_challenge: string }
+        | undefined;
       if (!row) throw new Error('Invalid authorization code');
       return row.code_challenge;
     },
@@ -468,5 +619,5 @@ export type WebchatMcpOAuthBackend = ReturnType<typeof createWebchatMcpOAuthBack
 export function resetWebchatMcpOAuthForTests(): void {
   ensureWebchatMcpOAuthSchema();
   const db = getAuthDbInternal();
-  db.exec('DELETE FROM web_mcp_oauth_clients; DELETE FROM web_mcp_oauth_codes;');
+  db.exec('DELETE FROM web_mcp_oauth_clients; DELETE FROM web_mcp_oauth_codes; DELETE FROM web_mcp_oauth_consents;');
 }

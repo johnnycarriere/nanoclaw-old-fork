@@ -115,8 +115,7 @@ export function shouldDeliverWsEvent(
   if (event.forUserId) return event.forUserId === clientUserId;
 
   const platformId =
-    event.platformId ??
-    (event.message && typeof event.message === 'object' ? event.message.platformId : undefined);
+    event.platformId ?? (event.message && typeof event.message === 'object' ? event.message.platformId : undefined);
   if (!platformId) return false;
   const logical = toLogicalPlatformId(platformId);
   if (isSharedRoom(logical)) return true;

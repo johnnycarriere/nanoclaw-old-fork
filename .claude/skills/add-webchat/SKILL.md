@@ -142,6 +142,74 @@ WEBCHAT_DISPLAY_NAME=Local         # optional
 
 Generate secret: `node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"`
 
+Local mode (the default, `WEBCHAT_AUTH_MODE=local`) is loopback-only: the host refuses to start if
+`WEBCHAT_BIND_ADDRESS` or `WEBCHAT_PUBLIC_BASE_URL` points beyond localhost. To expose webchat on the
+internet (e.g. behind nginx, see `deploy/nginx-bawdeclaw.bawapps.com.conf`) switch to public mode.
+
+## Public mode
+
+`WEBCHAT_AUTH_MODE=public` replaces the static secret with per-user sessions. In public mode the static
+`WEBCHAT_SECRET` (bearer / `?token=`) is **ignored entirely**; only browser sessions and MCP OAuth access
+tokens are accepted.
+
+```bash
+WEBCHAT_AUTH_MODE=public
+WEBCHAT_PUBLIC_BASE_URL=https://chat.example.com   # exact public origin; WebSocket Origin must match
+WEBCHAT_BIND_ADDRESS=127.0.0.1                     # keep loopback; the reverse proxy fronts it
+WEBCHAT_SESSION_SECRET=<32+ random chars>          # HMAC key for session cookies + MCP tokens
+WEBCHAT_SESSION_TTL_SECONDS=86400                  # optional
+WEBCHAT_SECURE_COOKIES=true                        # default true; WEBCHAT_SESSION_INSECURE_COOKIES=true for plain-http dev
+
+# Basic login (per-user hashes — preferred)
+WEBCHAT_AUTH_BASIC_ENABLED=true
+WEBCHAT_BASIC_USERS=alice:scrypt$...$...,bob:sha256$<hex>
+WEBCHAT_BASIC_DISPLAY_NAMES=alice:Alice            # optional
+# Legacy shared password (still supported; users without a hash fall back to it)
+WEBCHAT_BASIC_PASSWORD=<password>
+WEBCHAT_BASIC_ALLOWED_USERNAMES=alice,bob
+
+# OIDC / OAuth login (optional)
+WEBCHAT_AUTH_OIDC_ENABLED=true
+WEBCHAT_OIDC_PROVIDERS='[{"id":"github","protocol":"oauth",...}]'   # or WEBCHAT_OIDC_PROVIDERS_FILE=path
+WEBCHAT_OIDC_REDIRECT_URI=https://chat.example.com/api/auth/callback
+WEBCHAT_OIDC_ALLOWED_EMAILS=you@example.com        # and/or _ALLOWED_EMAIL_DOMAINS / _ALLOWED_SUBS / _REQUIRED_GROUP
+
+# MCP over HTTP (opt-in in every mode)
+WEBCHAT_MCP_HTTP_ENABLED=false
+WEBCHAT_MCP_ALLOW_DCR=false                        # OAuth dynamic client registration (/register); 403 when off
+WEBCHAT_MCP_TOKEN_TTL_SECONDS=86400
+
+WEBCHAT_MAX_UPLOAD_BYTES=52428800                  # 50 MiB default; match nginx client_max_body_size
+```
+
+Generate a password hash for `WEBCHAT_BASIC_USERS` (scrypt, random salt):
+
+```bash
+pnpm exec tsx -e "import('./src/webchat-auth.js').then(m => console.log(m.hashBasicPassword(process.argv[1])))" -- 'your-password'
+```
+
+Entries are `username:<hash>`; usernames are case-insensitive. `sha256$<hex>` hashes are also accepted
+(`printf %s 'pw' | sha256sum`) but scrypt is preferred.
+
+What public mode enforces:
+
+- **Login rate limiting** — token bucket per client IP (`X-Real-IP` is trusted only when the request
+  comes from a loopback proxy) plus exponential per-username backoff after 5 failed attempts (429 +
+  `Retry-After`).
+- **OIDC state binding** — the OAuth `state` is tied to a short-lived HttpOnly cookie; a callback from
+  another browser is rejected. `id_token`s must carry `exp`; RS256 and ES256 are verified.
+- **WebSocket Origin** — upgrades whose `Origin` differs from `WEBCHAT_PUBLIC_BASE_URL` are refused.
+- **Attachments** — downloads require access to the room the message lives in; every attachment is
+  served with `Content-Disposition: attachment`, `CSP: sandbox`, `nosniff`, and HTML/SVG/XML/JS as
+  `text/plain`.
+- **Lobby threads** — only the creator or an owner may delete a lobby thread.
+- **MCP OAuth** — `/authorize` never issues a code directly: the user lands on a same-origin consent
+  page (`/mcp/consent`) showing the client, redirect URI and scopes, and the code is issued only on the
+  CSRF-checked Approve. Dynamic client registration is off unless `WEBCHAT_MCP_ALLOW_DCR=true` — set it
+  temporarily while an MCP client registers, then turn it off (registered clients persist).
+- **Uploads** — 50 MiB default, at most 32 in-flight chunked uploads (4 per user); staging lives under
+  `data/webchat-uploads/` and is swept on boot.
+
 ## Verify
 
 Open `http://127.0.0.1:3200` — auth token is injected by the host (no paste step).
