@@ -8,7 +8,7 @@
  * time, but a context-compaction storm exposed 26 simultaneous re-fires.
  *
  * Fix: persist last-emitted status per message in `host_reaction_state`
- * (migration 014). These tests lock in the no-replay behavior across
+ * (module migration `module:fork:host-reaction-state`). These tests lock in the no-replay behavior across
  * sweep ticks AND across simulated host restarts.
  */
 import Database from 'better-sqlite3';
@@ -16,11 +16,17 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('./channels/channel-registry.js', () => ({
   getChannelAdapter: vi.fn(),
+  getChannelAdapterExact: vi.fn(),
 }));
 
-import { getChannelAdapter } from './channels/channel-registry.js';
+import { getChannelAdapter, getChannelAdapterExact } from './channels/channel-registry.js';
 import { initTestDb, closeDb, runMigrations, getDb } from './db/index.js';
-import { backfillReactionStateFromOutDb, emitStatusReactions } from './status-reactions.js';
+import {
+  backfillReactionStateFromOutDb,
+  emitStatusReactions,
+  nativeMessageId,
+  resetStatusReactionWatermarks,
+} from './status-reactions.js';
 
 interface MockAdapter {
   postReaction: ReturnType<typeof vi.fn>;
@@ -79,7 +85,13 @@ beforeEach(async () => {
   inDb.exec(INBOUND_SCHEMA);
   outDb.exec(OUTBOUND_SCHEMA);
   mockAdapter.postReaction.mockClear();
-  vi.mocked(getChannelAdapter).mockReturnValue(mockAdapter as never);
+  vi.mocked(getChannelAdapter)
+    .mockReset()
+    .mockReturnValue(mockAdapter as never);
+  vi.mocked(getChannelAdapterExact)
+    .mockReset()
+    .mockReturnValue(mockAdapter as never);
+  resetStatusReactionWatermarks();
 });
 
 afterEach(async () => {
@@ -238,5 +250,43 @@ describe('emitStatusReactions — idempotency', () => {
     await emitStatusReactions(inDb, outDb);
     await emitStatusReactions(inDb, outDb);
     expect(mockAdapter.postReaction).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('nativeMessageId', () => {
+  it('strips the known agent-group suffix and takes the telegram message id', () => {
+    expect(nativeMessageId('1644976441:100:ag-1', 'ag-1')).toBe('100');
+    // Agent group ids may themselves contain ':' — only the exact suffix is stripped.
+    expect(nativeMessageId('1644976441:100:ag:x', 'ag:x')).toBe('100');
+  });
+
+  it('yields nothing for non-telegram ids (no ":" left after the strip)', () => {
+    expect(nativeMessageId('discord-msg-1:ag-1', 'ag-1')).toBeUndefined();
+    expect(nativeMessageId('1644976441:100:ag-1', 'other')).toBeUndefined();
+  });
+
+  it('falls back to last-segment strip when the agent group is unknown', () => {
+    expect(nativeMessageId('1644976441:100:ag-1')).toBe('100');
+    expect(nativeMessageId('opaque:ag-1')).toBeUndefined();
+  });
+});
+
+describe('emitStatusReactions — adapter and id resolution', () => {
+  it('skips non-telegram composite ids instead of posting a bogus reaction', async () => {
+    seedInbound(['discord-msg-1:ag-1']);
+    seedAck('discord-msg-1:ag-1', 'completed');
+    await emitStatusReactions(inDb, outDb, { agentGroupId: 'ag-1' });
+    expect(mockAdapter.postReaction).toHaveBeenCalledTimes(0);
+  });
+
+  it('resolves the adapter by the messaging-group instance when one is recorded', async () => {
+    const exact: MockAdapter = { postReaction: vi.fn().mockResolvedValue(undefined) };
+    vi.mocked(getChannelAdapterExact).mockReturnValue(exact as never);
+    seedInbound(['1644976441:900:ag-1']);
+    seedAck('1644976441:900:ag-1', 'completed');
+    await emitStatusReactions(inDb, outDb, { agentGroupId: 'ag-1', instance: 'telegram-2' });
+    expect(getChannelAdapterExact).toHaveBeenCalledWith('telegram-2');
+    expect(exact.postReaction).toHaveBeenCalledWith('telegram:123', '900', '👍');
+    expect(mockAdapter.postReaction).toHaveBeenCalledTimes(0);
   });
 });

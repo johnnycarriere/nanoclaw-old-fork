@@ -20,10 +20,10 @@ Baw De Claw writes dev handoffs (markdown files) into `groups/telegram_main/hand
 
 ## `/handoff watch`
 
-Arm a persistent Monitor on the queue so new handoffs pop into this session live:
+Arm a persistent Monitor on the queue so new handoffs pop into this session live (run from the repo root):
 
 ```bash
-cd /home/jlc/nanoclaw-v2 && Q=groups/telegram_main/handoffs/queue; known=$(ls "$Q" 2>/dev/null | sort); while true; do now=$(ls "$Q" 2>/dev/null | sort); new=$(comm -13 <(echo "$known") <(echo "$now")); [ -n "$new" ] && echo "NEW HANDOFF from Baw: $new"; known="$now"; sleep 15; done
+Q=groups/telegram_main/handoffs/queue; known=$(ls "$Q" 2>/dev/null | sort); while true; do now=$(ls "$Q" 2>/dev/null | sort); new=$(comm -13 <(echo "$known") <(echo "$now")); [ -n "$new" ] && echo "NEW HANDOFF from Baw: $new"; known="$now"; sleep 15; done
 ```
 
 Run it via the Monitor tool (`persistent: true`). When a NEW HANDOFF event fires, tell Johnny what arrived and start on it (per the default flow **including the claim step**) unless he redirects.

@@ -5,6 +5,7 @@
  * Routes patterns and DM rooms are wired by webchat-sync.ts; this adapter only
  * transports messages through the normal router/delivery path.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
@@ -27,7 +28,7 @@ import {
 } from '../webchat-sync.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../modules/permissions/db/user-roles.js';
 import type { PublicAuthConfig } from '../webchat-auth-config.js';
-import { loadWebAdapterAuthConfig } from '../webchat-auth-config.js';
+import { isLoopbackHost, loadWebAdapterAuthConfig } from '../webchat-auth-config.js';
 import {
   handlePublicAuthRequest,
   isPublicAuthExemptPath,
@@ -37,8 +38,10 @@ import {
 import { ensureWebchatAuthSchema } from '../webchat-auth-sessions.js';
 import {
   createWebchatMcpOAuthBackend,
+  MCP_CONSENT_PATH,
   verifyMcpAccessToken,
   type McpAccessTokenUser,
+  type McpPendingConsent,
   type WebchatMcpOAuthBackend,
 } from '../webchat-mcp-oauth.js';
 import {
@@ -77,8 +80,10 @@ import {
   enrichMessagesWithAttachmentData,
   getEngagedAgents,
   getMessageAttachmentPath,
+  getMessageLocation,
   getMessages,
   getRecentMessages,
+  getThreadCreator,
   hasBackfillDelivered,
   listThreads,
   MAIN_THREAD,
@@ -105,6 +110,7 @@ import {
   getStagedUpload,
   parseMultipartUpload,
   restoreStagedUpload,
+  sweepUploadStaging,
   type StagedUpload,
 } from '../webchat-uploads.js';
 import { inferAttachmentMime, serveAttachmentFile } from '../webchat-serve-attachment.js';
@@ -158,6 +164,8 @@ interface WebAdapterOptions {
   displayName: string;
   publicAuth?: PublicAuthConfig;
   mcpHttpEnabled?: boolean;
+  /** Expose OAuth dynamic client registration (/register). Default off — 403. */
+  mcpAllowDynamicClientRegistration?: boolean;
   publicBaseUrl?: string;
   mcpTokenTtlSeconds?: number;
 }
@@ -800,7 +808,7 @@ async function routeLobbyInbound(
 
   for (const receiverFolder of engagedAfter) {
     if (newlyEngaged.includes(receiverFolder)) {
-      dispatchBackfillForAgent(
+      void dispatchBackfillForAgent(
         platformId,
         threadId,
         threadIdStored,
@@ -814,9 +822,9 @@ async function routeLobbyInbound(
     }
 
     const chainKey = deliveryChainKey(platformId, threadIdStored, receiverFolder);
-    enqueueAgentDelivery(chainKey, async () => {
+    void enqueueAgentDelivery(chainKey, async () => {
       const routing = buildRoutingMetadata(receiverFolder, explicitMentions, implicitMentions, engagedAfter, false);
-      let deliveryText = trimmedText;
+      const deliveryText = trimmedText;
       const routingContent: Record<string, unknown> = {
         ...content,
         text: deliveryText,
@@ -876,7 +884,7 @@ async function fanOutPeerReply(
   for (const peerFolder of peers) {
     const routing = buildRoutingMetadata(peerFolder, [], [], engaged, true);
     const peerInbound: InboundMessage = {
-      id: `web-peer-${Date.now()}-${peerFolder}-${Math.random().toString(36).slice(2, 6)}`,
+      id: `web-peer-${crypto.randomUUID()}-${peerFolder}`,
       kind: 'chat',
       content: {
         text: outboundText,
@@ -927,6 +935,49 @@ function parseBearerAuthorization(header: string | undefined): string | null {
   if (!header?.startsWith('Bearer ')) return null;
   const token = header.slice('Bearer '.length).trim();
   return token || null;
+}
+
+/** Constant-time string compare (hashes both sides so length never short-circuits). */
+function constantTimeEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a, 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(b, 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+/** Request path without the query string, for logs (tokens may travel in `?token=`). */
+function logPath(rawUrl: string | undefined): string {
+  if (!rawUrl) return '/';
+  const q = rawUrl.indexOf('?');
+  return q === -1 ? rawUrl : rawUrl.slice(0, q);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Minimal same-origin consent page; the form POSTs back with the session-bound CSRF token. */
+export function renderMcpConsentPage(consent: McpPendingConsent, formAction: string): string {
+  const client = escapeHtml(consent.clientName ?? consent.clientId);
+  const scopes = consent.scopes.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`).join('');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authorize ${client}</title>
+<style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;line-height:1.5}code{word-break:break-all}button{font:inherit;padding:.5rem 1.25rem;margin-right:.5rem}</style>
+</head><body>
+<h1>Authorize ${client}?</h1>
+<p><strong>${client}</strong> wants to access NanoClaw Web Chat as <strong>${escapeHtml(consent.displayName)}</strong> (<code>${escapeHtml(consent.userId)}</code>).</p>
+<p>Client id: <code>${escapeHtml(consent.clientId)}</code><br>Redirect URI: <code>${escapeHtml(consent.redirectUri)}</code></p>
+<p>Requested scopes:</p><ul>${scopes}</ul>
+<form method="post" action="${escapeHtml(formAction)}">
+<input type="hidden" name="id" value="${escapeHtml(consent.id)}">
+<input type="hidden" name="csrf" value="${escapeHtml(consent.csrfToken)}">
+<button type="submit" name="action" value="approve">Approve</button>
+<button type="submit" name="action" value="deny">Deny</button>
+</form>
+</body></html>`;
 }
 
 function internalApiBase(port: number, bindAddress?: string): string {
@@ -1003,22 +1054,47 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
         }
       }
       if (isPublicAuthPath(url.pathname) && isPublicAuthExemptPath(url.pathname)) return true;
-      if (resolveSessionUser(opts.publicAuth!, req) != null) return true;
+      // Public mode: only browser sessions and MCP access tokens. The static
+      // WEBCHAT_SECRET is never accepted here — it is a local-mode credential.
+      return resolveSessionUser(opts.publicAuth!, req) != null;
     }
 
-    if (bearerHeader === `Bearer ${opts.authToken}`) return true;
+    if (bearer !== null && constantTimeEqual(bearer, opts.authToken)) return true;
     // Browser img/fetch cannot set Authorization; ?token= is accepted for /api/ws and
     // /api/attachments (weaker — may appear in logs/history/referrer).
     if (url.pathname === '/api/ws' || url.pathname.startsWith('/api/attachments/')) {
       const q = url.searchParams.get('token');
-      if (q === opts.authToken) return true;
-    }
-
-    if (isPublicMode()) {
-      return false;
+      if (q !== null && constantTimeEqual(q, opts.authToken)) return true;
     }
 
     return false;
+  }
+
+  /**
+   * WebSocket upgrade origin check. Browsers always send Origin on WS upgrades;
+   * a mismatch means a cross-site page is trying to ride the session cookie.
+   * Non-browser clients (no Origin) are left to checkAuth.
+   */
+  function wsOriginAllowed(originHeader: string | undefined): boolean {
+    if (originHeader === undefined) return true;
+    let origin: URL;
+    try {
+      origin = new URL(originHeader);
+    } catch {
+      return false;
+    }
+    if (isPublicMode() && opts.publicBaseUrl) {
+      let expected: URL;
+      try {
+        expected = new URL(opts.publicBaseUrl);
+      } catch {
+        return false;
+      }
+      return origin.origin === expected.origin;
+    }
+    // Local (or public without a base URL): loopback host on this adapter's port.
+    const port = origin.port || (origin.protocol === 'https:' ? '443' : '80');
+    return isLoopbackHost(origin.hostname) && port === String(opts.port);
   }
 
   function broadcast(event: unknown): void {
@@ -1211,7 +1287,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     }
 
     const threadId = threadIdRaw === MAIN_THREAD ? null : threadIdRaw;
-    const id = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const id = `web-${crypto.randomUUID()}`;
     const timestamp = new Date().toISOString();
     const isGroup = logicalPlatformId === WEB_LOBBY_PLATFORM_ID;
 
@@ -1391,6 +1467,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     threadId: string,
     req: http.IncomingMessage,
     res: http.ServerResponse,
+    ownerId: string,
   ): Promise<void> {
     let body: string;
     try {
@@ -1434,6 +1511,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       },
       platformId,
       threadId,
+      ownerId,
     );
     if (!result.ok) {
       json(res, result.status, { error: result.error });
@@ -1539,6 +1617,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     platformId: string,
     req: http.IncomingMessage,
     res: http.ServerResponse,
+    createdBy: string,
   ): Promise<void> {
     let title = 'Thread';
     try {
@@ -1553,7 +1632,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       json(res, 400, { error: 'Invalid JSON' });
       return;
     }
-    const thread = createThread(platformId, title);
+    const thread = createThread(platformId, title, createdBy);
     json(res, 200, thread);
   }
 
@@ -1586,9 +1665,26 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     json(res, 200, { id: threadId, title });
   }
 
-  async function handleDeleteThread(platformId: string, threadId: string, res: http.ServerResponse): Promise<void> {
+  /** Shared-room (lobby) threads may only be deleted by their creator or an owner. */
+  async function canDeleteThread(platformId: string, threadId: string, actorUserId: string): Promise<boolean> {
+    if (!isPublicMode() || platformId !== WEB_LOBBY_PLATFORM_ID) return true;
+    const creator = getThreadCreator(platformId, threadId);
+    if (creator !== null && creator === actorUserId) return true;
+    return isOwner(actorUserId);
+  }
+
+  async function handleDeleteThread(
+    platformId: string,
+    threadId: string,
+    res: http.ServerResponse,
+    actorUserId: string,
+  ): Promise<void> {
     if (threadId === MAIN_THREAD) {
       json(res, 400, { error: 'cannot delete main thread' });
+      return;
+    }
+    if (!(await canDeleteThread(platformId, threadId, actorUserId))) {
+      json(res, 403, { error: 'only the thread creator or an owner can delete this thread' });
       return;
     }
     deleteThreadData(platformId, threadId);
@@ -1617,6 +1713,64 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     serveAttachmentFile(filePath, storageName, req, res);
   }
 
+  function html(res: http.ServerResponse, status: number, body: string): void {
+    res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(body);
+  }
+
+  function consentFormAction(): string {
+    const prefix = (opts.publicPath ?? '').replace(/\/+$/, '');
+    return `${prefix}${MCP_CONSENT_PATH}`;
+  }
+
+  /** GET renders the consent page; POST (same-origin form + CSRF) issues or denies the code. */
+  async function handleMcpConsent(req: http.IncomingMessage, url: URL, res: http.ServerResponse): Promise<void> {
+    const backend = mcpOAuthBackend!;
+    if (req.method === 'GET') {
+      const consentId = url.searchParams.get('id') ?? '';
+      if (!resolveSessionUser(opts.publicAuth!, req)) {
+        const returnTo = new URL(
+          `${consentFormAction()}?id=${encodeURIComponent(consentId)}`,
+          `${opts.publicBaseUrl}/`,
+        );
+        res.writeHead(302, { Location: `/?returnTo=${encodeURIComponent(returnTo.toString())}` });
+        res.end();
+        return;
+      }
+      const consent = backend.getPendingConsent(req, consentId);
+      if (!consent) {
+        html(res, 400, '<!DOCTYPE html><html><body><h1>Unknown or expired authorization request</h1></body></html>');
+        return;
+      }
+      html(res, 200, renderMcpConsentPage(consent, consentFormAction()));
+      return;
+    }
+    if (req.method === 'POST') {
+      let body: string;
+      try {
+        body = await readBody(req, 4096);
+      } catch {
+        json(res, 413, { error: 'payload too large' });
+        return;
+      }
+      const form = new URLSearchParams(body);
+      const decision = backend.decideConsent(
+        req,
+        form.get('id') ?? '',
+        form.get('csrf') ?? '',
+        form.get('action') === 'approve',
+      );
+      if (decision.type === 'redirect') {
+        res.writeHead(302, { Location: decision.location, 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      html(res, decision.status, `<!DOCTYPE html><html><body><h1>${escapeHtml(decision.message)}</h1></body></html>`);
+      return;
+    }
+    res.writeHead(405, { Allow: 'GET, POST' }).end();
+  }
+
   return {
     name: 'web',
     channelType: CHANNEL_TYPE,
@@ -1625,6 +1779,8 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
     async setup(config: ChannelSetup): Promise<void> {
       setupConfig = config;
       ensureWebchatSchema();
+      // Staged uploads are tracked in memory only; anything left on disk is orphaned.
+      sweepUploadStaging();
       if (isPublicMode()) ensureWebchatAuthSchema();
 
       if (isPublicMode() && opts.publicBaseUrl && opts.publicAuth) {
@@ -1634,6 +1790,8 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
           publicBaseUrl: opts.publicBaseUrl,
           resourceServerUrl: mcpResourceServerUrl,
           tokenTtlSeconds: opts.mcpTokenTtlSeconds,
+          allowDynamicClientRegistration: opts.mcpAllowDynamicClientRegistration === true,
+          consentPath: consentFormAction(),
         });
         if (opts.mcpHttpEnabled) {
           try {
@@ -1662,12 +1820,24 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
         throw err;
       }
 
-      server = http.createServer(async (req, res) => {
+      const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         try {
           const url = new URL(req.url ?? '/', `http://127.0.0.1:${opts.port}`);
 
           if (mcpHttpListener && mcpHttpPathMatches?.(url.pathname)) {
+            if (url.pathname === '/register' && !mcpOAuthBackend?.allowDynamicClientRegistration) {
+              json(res, 403, {
+                error: 'access_denied',
+                error_description: 'Dynamic client registration is disabled (WEBCHAT_MCP_ALLOW_DCR)',
+              });
+              return;
+            }
             mcpHttpListener(req, res);
+            return;
+          }
+
+          if (mcpOAuthBackend && isPublicMode() && url.pathname === MCP_CONSENT_PATH) {
+            await handleMcpConsent(req, url, res);
             return;
           }
 
@@ -1712,6 +1882,14 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
             if (attMatch && req.method === 'GET') {
               const messageId = decodeURIComponent(attMatch[1]!);
               const storageName = decodeURIComponent(attMatch[2]!);
+              // Same room gate as /api/rooms: the requester must have access to the
+              // room the message lives in (lobby is shared; DMs/inbox are per-user).
+              const location = getMessageLocation(messageId);
+              if (!location) {
+                res.writeHead(404).end();
+                return;
+              }
+              if (tryResolveStoragePlatformId(location.platformId, requestUser.userId, res) === undefined) return;
               serveAttachment(messageId, storageName, req, res);
               return;
             }
@@ -1721,7 +1899,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
               const logicalPlatformId = decodeURIComponent(threadsMatch[1]!);
               const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
-              await handleCreateThread(storagePlatformId, req, res);
+              await handleCreateThread(storagePlatformId, req, res, requestUser.userId);
               return;
             }
 
@@ -1736,7 +1914,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
                 return;
               }
               if (req.method === 'DELETE') {
-                await handleDeleteThread(storagePlatformId, threadId, res);
+                await handleDeleteThread(storagePlatformId, threadId, res, requestUser.userId);
                 return;
               }
             }
@@ -1767,7 +1945,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
               const threadId = decodeURIComponent(uploadChunkMatch[2]!);
               const storagePlatformId = tryResolveStoragePlatformId(logicalPlatformId, requestUser.userId, res);
               if (storagePlatformId === undefined) return;
-              await handleChunkUpload(storagePlatformId, threadId, req, res);
+              await handleChunkUpload(storagePlatformId, threadId, req, res, requestUser.userId);
               return;
             }
 
@@ -1828,12 +2006,15 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
 
           res.writeHead(404).end();
         } catch (err) {
-          log.error('Web channel request failed', { err, path: req.url });
+          log.error('Web channel request failed', { err, path: logPath(req.url) });
           /* v8 ignore if -- streaming handlers may have already started the response */
           if (!res.headersSent) {
             json(res, 500, { error: 'Internal server error' });
           }
         }
+      };
+      server = http.createServer((req, res) => {
+        void handleRequest(req, res);
       });
 
       wss = new WebSocketServer({ noServer: true });
@@ -1841,6 +2022,11 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       server.on('upgrade', (req, socket, head) => {
         const url = new URL(req.url ?? '/', `http://127.0.0.1:${opts.port}`);
         if (url.pathname !== '/api/ws') {
+          socket.destroy();
+          return;
+        }
+        if (!wsOriginAllowed(req.headers.origin)) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
           socket.destroy();
           return;
         }
@@ -1922,7 +2108,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
           ? await resolveApprovalSessionOrigin(askQuestion.questionId)
           : undefined;
         const senderName = extractSenderName(message.content) ?? origin?.agentName;
-        const id = `web-out-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const id = `web-out-${crypto.randomUUID()}`;
         persistAndBroadcast({
           id,
           direction: 'outbound',
@@ -1938,7 +2124,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
           origin &&
           (await shouldMirrorApprovalToOrigin(origin, askQuestion.questionId, platformId, isPublicMode()))
         ) {
-          const mirrorId = `web-out-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          const mirrorId = `web-out-${crypto.randomUUID()}`;
           persistAndBroadcast({
             id: mirrorId,
             direction: 'outbound',
@@ -1958,7 +2144,7 @@ export function createWebAdapter(opts: WebAdapterOptions): ChannelAdapter {
       const attachments =
         message.files?.map(outboundFileToAttachment).filter((a): a is WebChatAttachment => a !== null) ?? [];
       if (!text.trim() && attachments.length === 0) return undefined;
-      const id = `web-out-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const id = `web-out-${crypto.randomUUID()}`;
       const senderName = extractSenderName(message.content);
       const stored = persistAndBroadcast({
         id,
@@ -2034,6 +2220,7 @@ registerChannelAdapter('web', {
       displayName: cfg.localDisplayName,
       publicAuth: cfg.public,
       mcpHttpEnabled: cfg.mcpHttpEnabled,
+      mcpAllowDynamicClientRegistration: cfg.mcpAllowDynamicClientRegistration,
       publicBaseUrl: cfg.publicBaseUrl,
       mcpTokenTtlSeconds: cfg.mcpTokenTtlSeconds,
     });

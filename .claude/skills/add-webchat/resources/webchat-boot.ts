@@ -23,20 +23,22 @@ import { refreshWebchatAfterAgentChange } from './webchat-live.js';
 async function installAgentGroupLiveRefresh(): Promise<void> {
   try {
     const { registerDeliveryAction, reenterGuardedDeliveryAction } = await import('./delivery.js');
-    const { notifyAgent } = await import('./modules/approvals/index.js');
-    const { registerApprovalHandler, getApprovalHandler } = await import(
-      './modules/approvals/primitive.js'
-    );
-    const { createAgent, requestCreateAgentHold, validateCreateAgent } = await import(
-      './modules/agent-to-agent/create-agent.js'
-    );
+    const { registerApprovalHandler, getApprovalHandler } = await import('./modules/approvals/primitive.js');
+    const { createAgent, validateCreateAgent, requestCreateAgentHold } =
+      await import('./modules/agent-to-agent/create-agent.js');
     const { agentsCreate } = await import('./modules/agent-to-agent/guard.js');
+    const { notifyAgent } = await import('./modules/approvals/index.js');
 
+    // Re-register create_agent with the SAME guard spec upstream uses (an
+    // unguarded re-register would throw — it would disarm the guard), only
+    // wrapping the handler to refresh webchat after the agent is created.
+    // Approval re-entry goes through this same handler via
+    // reenterGuardedDeliveryAction, so the refresh covers both paths.
     registerDeliveryAction(
       'create_agent',
       async (content, session) => {
         await createAgent(content, session);
-        refreshWebchatAfterAgentChange();
+        await refreshWebchatAfterAgentChange();
       },
       {
         guardAction: agentsCreate,
@@ -46,6 +48,8 @@ async function installAgentGroupLiveRefresh(): Promise<void> {
       },
     );
 
+    // Approval re-entry must point at the freshly wrapped entry, not any
+    // handler captured before the re-register.
     registerApprovalHandler('create_agent', reenterGuardedDeliveryAction('create_agent'));
 
     // Wrap CLI delete (and only delete) so approved `ncl groups delete` drops
@@ -56,7 +60,7 @@ async function installAgentGroupLiveRefresh(): Promise<void> {
         await existingCli(ctx);
         const frame = ctx.payload?.frame as { command?: string } | undefined;
         if (frame?.command === 'groups-delete') {
-          refreshWebchatAfterAgentChange();
+          await refreshWebchatAfterAgentChange();
         }
       });
       log.info('Webchat groups-delete live refresh installed');
@@ -78,7 +82,7 @@ export async function startWebChat(): Promise<void> {
     return;
   }
 
-  syncWebchatWirings();
+  await syncWebchatWirings();
   ensureWebchatSchema();
   await installAgentGroupLiveRefresh();
   const port = process.env.WEBCHAT_PORT || env.WEBCHAT_PORT || '3200';

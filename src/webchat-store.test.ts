@@ -699,7 +699,7 @@ describe('webchat-store', () => {
     const run = vi.fn();
     const db = {
       prepare: vi.fn((sql: string) => ({
-        all: (...args: unknown[]) => {
+        all: () => {
           if (sql.includes('DISTINCT')) return [{ platform_id: 'lobby', thread_id: MAIN_THREAD }];
           if (sql.includes('thread_seq IS NULL') && sql.includes('ORDER BY')) return [];
           return [];

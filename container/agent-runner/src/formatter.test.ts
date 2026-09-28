@@ -14,6 +14,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { MAX_IMAGES_PER_PROMPT, MAX_IMAGE_BYTES_PER_PROMPT, type ImageContent } from './attachments.js';
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './mailbox/sqlite/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
 import {
@@ -372,10 +373,89 @@ describe('image attachment inlining (formatMessagesForPrompt) — fork', () => {
     expect(result.images).toHaveLength(1);
     expect(result.images[0].mediaType).toBe('image/png');
     expect(result.images[0].data).toBe(PNG_1X1.toString('base64'));
-    // Placeholder kept so the model can correlate the rendered image with
-    // its message context; the verbose path marker is gone.
-    expect(result.text).toContain('[image: pic.png]');
+    // Numbered placeholder kept so the model can correlate the rendered
+    // image with its message context; the verbose path marker is gone.
+    expect(result.text).toContain('[image 1: pic.png]');
     expect(result.text).not.toContain('saved to /workspace/');
+    expect(result.images[0].bytes).toBe(PNG_1X1.length);
+  });
+
+  it('numbers placeholders in sink order across messages', () => {
+    fs.writeFileSync(path.join(tmpRoot, 'inbox', 'a.png'), PNG_1X1);
+    fs.writeFileSync(path.join(tmpRoot, 'inbox', 'b.png'), PNG_1X1);
+    insertMessage('m1', 'chat-sdk', {
+      sender: 'Johnny',
+      text: 'first',
+      attachments: [{ type: 'image', name: 'a.png', localPath: 'inbox/a.png' }],
+    });
+    insertMessage('m2', 'chat-sdk', {
+      sender: 'Johnny',
+      text: 'second',
+      attachments: [{ type: 'image', name: 'b.png', localPath: 'inbox/b.png' }],
+    });
+
+    const result = formatMessagesForPrompt(getPendingMessages());
+
+    expect(result.images).toHaveLength(2);
+    expect(result.text.indexOf('[image 1: a.png]')).toBeGreaterThan(0);
+    expect(result.text.indexOf('[image 2: b.png]')).toBeGreaterThan(result.text.indexOf('[image 1: a.png]'));
+  });
+
+  it('continues numbering and budget on a caller-supplied sink', () => {
+    fs.writeFileSync(path.join(tmpRoot, 'inbox', 'c.png'), PNG_1X1);
+    insertMessage('m1', 'chat-sdk', {
+      sender: 'Johnny',
+      text: 'third',
+      attachments: [{ type: 'image', name: 'c.png', localPath: 'inbox/c.png' }],
+    });
+    const sink: ImageContent[] = [
+      { mediaType: 'image/png', data: 'AA==', bytes: 1 },
+      { mediaType: 'image/png', data: 'AA==', bytes: 1 },
+    ];
+
+    const result = formatMessagesForPrompt(getPendingMessages(), sink);
+
+    expect(result.images).toBe(sink);
+    expect(sink).toHaveLength(3);
+    expect(result.text).toContain('[image 3: c.png]');
+  });
+
+  it('falls back to the path marker once the per-prompt image count is spent', () => {
+    for (let i = 0; i < MAX_IMAGES_PER_PROMPT + 1; i++) {
+      fs.writeFileSync(path.join(tmpRoot, 'inbox', `p${i}.png`), PNG_1X1);
+    }
+    insertMessage('m1', 'chat-sdk', {
+      sender: 'Johnny',
+      text: 'album',
+      attachments: Array.from({ length: MAX_IMAGES_PER_PROMPT + 1 }, (_, i) => ({
+        type: 'image',
+        name: `p${i}.png`,
+        localPath: `inbox/p${i}.png`,
+      })),
+    });
+
+    const result = formatMessagesForPrompt(getPendingMessages());
+
+    expect(result.images).toHaveLength(MAX_IMAGES_PER_PROMPT);
+    expect(result.text).toContain(`[image ${MAX_IMAGES_PER_PROMPT}: p${MAX_IMAGES_PER_PROMPT - 1}.png]`);
+    expect(result.text).toContain(`[image: p${MAX_IMAGES_PER_PROMPT}.png — saved to /workspace/inbox/p${MAX_IMAGES_PER_PROMPT}.png]`);
+  });
+
+  it('falls back to the path marker once the per-prompt byte budget is spent', () => {
+    fs.writeFileSync(path.join(tmpRoot, 'inbox', 'last.png'), PNG_1X1);
+    insertMessage('m1', 'chat-sdk', {
+      sender: 'Johnny',
+      text: 'one more',
+      attachments: [{ type: 'image', name: 'last.png', localPath: 'inbox/last.png' }],
+    });
+    // A sink already holding (nearly) the whole byte budget.
+    const sink: ImageContent[] = [{ mediaType: 'image/jpeg', data: 'AA==', bytes: MAX_IMAGE_BYTES_PER_PROMPT - 10 }];
+
+    const result = formatMessagesForPrompt(getPendingMessages(), sink);
+
+    expect(sink).toHaveLength(1);
+    expect(result.text).toContain('[image: last.png — saved to /workspace/inbox/last.png]');
+    expect(result.text).not.toContain('[image 2:');
   });
 
   it('falls back to the path marker when the image file is missing', () => {

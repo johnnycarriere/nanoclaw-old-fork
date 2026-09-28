@@ -998,10 +998,10 @@ describe('router — per-wiring thread policy', () => {
       },
     });
 
-    // FORK OVERRIDE: this install hardcodes unknown_sender_policy 'strict'
-    // for every auto-created messaging group (see src/router.ts) instead of
-    // upstream's declaration-driven resolveUnknownSenderPolicy. All three
-    // cases therefore expect 'strict'.
+    // FORK: router.ts wraps upstream's resolveUnknownSenderPolicy with
+    // FORK_DEFAULT_UNKNOWN_SENDER_POLICY = 'strict', so every auto-created
+    // messaging group (declared group, declared DM, undeclared channel)
+    // lands on 'strict' regardless of the channel declaration.
     await routeInbound(mention('tp-declared', 'tp:G1', true));
     expect((await getMessagingGroupByPlatform('tp-declared', 'tp:G1'))!.unknown_sender_policy).toBe('strict');
 

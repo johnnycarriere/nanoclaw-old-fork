@@ -77,16 +77,12 @@ describe('startWebChat create_agent guard wiring', () => {
     await startWebChat();
 
     expect(registerDeliveryAction).toHaveBeenCalledTimes(1);
-    expect(registerDeliveryAction).toHaveBeenCalledWith(
-      'create_agent',
-      expect.any(Function),
-      {
-        guardAction: agentsCreate,
-        precheck: validateCreateAgent,
-        requestHold: requestCreateAgentHold,
-        onDeny: expect.any(Function),
-      },
-    );
+    expect(registerDeliveryAction).toHaveBeenCalledWith('create_agent', expect.any(Function), {
+      guardAction: agentsCreate,
+      precheck: validateCreateAgent,
+      requestHold: requestCreateAgentHold,
+      onDeny: expect.any(Function),
+    });
 
     expect(reenterGuardedDeliveryAction).toHaveBeenCalledWith('create_agent');
     expect(registerApprovalHandler).toHaveBeenCalledWith('create_agent', approvalContinuation);
@@ -95,10 +91,7 @@ describe('startWebChat create_agent guard wiring', () => {
 
   it('refreshes webchat after create_agent succeeds', async () => {
     await startWebChat();
-    const handler = registerDeliveryAction.mock.calls[0]![1] as (
-      content: unknown,
-      session: unknown,
-    ) => Promise<void>;
+    const handler = registerDeliveryAction.mock.calls[0]![1] as (content: unknown, session: unknown) => Promise<void>;
     const session = { id: 's1' };
     await handler({ name: 'x' }, session);
     expect(createAgent).toHaveBeenCalledWith({ name: 'x' }, session);
@@ -124,9 +117,6 @@ describe('startWebChat create_agent guard wiring', () => {
       'Webchat agent-group live refresh unavailable',
       expect.objectContaining({ err: expect.any(Error) }),
     );
-    expect(log.debug).not.toHaveBeenCalledWith(
-      'Webchat agent-group live refresh unavailable',
-      expect.anything(),
-    );
+    expect(log.debug).not.toHaveBeenCalledWith('Webchat agent-group live refresh unavailable', expect.anything());
   });
 });

@@ -739,3 +739,58 @@ describe('deliverSessionMessages — post-delivery hooks', () => {
     expect(delivered.has('th-2')).toBe(true);
   });
 });
+
+describe('deliverSessionMessages — platform rate limits', () => {
+  it('a retryAfter error defers the row (and the rest of the queue) without burning an attempt', async () => {
+    const { getDeliveryAttempt } = await import('./db/coordination.js');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-rl-1');
+    insertOutbound('ag-1', session.id, 'out-rl-2');
+
+    const calls: string[] = [];
+    let rateLimited = true;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        calls.push(content);
+        if (rateLimited) {
+          // Shape of @chat-adapter/shared's AdapterRateLimitError (seconds).
+          throw Object.assign(new Error('Rate limited by telegram, retry after 1s'), {
+            name: 'AdapterRateLimitError',
+            code: 'RATE_LIMITED',
+            retryAfter: 0.08,
+          });
+        }
+        return 'plat-ok';
+      },
+    });
+
+    // Attempt: rate limited → no attempt row, the second row is not overtaken.
+    await deliverSessionMessages(session);
+    expect(calls).toHaveLength(1);
+    expect(await getDeliveryAttempt('out-rl-1')).toBeUndefined();
+
+    // Still inside the retry-after window: nothing is sent.
+    await deliverSessionMessages(session);
+    expect(calls).toHaveLength(1);
+
+    // Window elapsed: both rows go out in order and are acknowledged.
+    await new Promise((r) => setTimeout(r, 120));
+    rateLimited = false;
+    await deliverSessionMessages(session);
+    expect(calls).toHaveLength(3);
+    const delivered = await withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds());
+    expect(delivered.has('out-rl-1')).toBe(true);
+    expect(delivered.has('out-rl-2')).toBe(true);
+    expect(await getDeliveryAttempt('out-rl-1')).toBeUndefined();
+  });
+
+  it('rateLimitRetryAfterMs reads retryAfter (s), retryAfterMs, and the RATE_LIMITED code', async () => {
+    const { rateLimitRetryAfterMs } = await import('./delivery.js');
+    expect(rateLimitRetryAfterMs(Object.assign(new Error('x'), { retryAfter: 2 }))).toBe(2000);
+    expect(rateLimitRetryAfterMs(Object.assign(new Error('x'), { retryAfterMs: 250 }))).toBe(250);
+    expect(rateLimitRetryAfterMs(Object.assign(new Error('x'), { code: 'RATE_LIMITED' }))).toBe(5000);
+    expect(rateLimitRetryAfterMs(new Error('network timeout'))).toBeNull();
+    expect(rateLimitRetryAfterMs(null)).toBeNull();
+  });
+});

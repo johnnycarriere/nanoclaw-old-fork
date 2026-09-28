@@ -13,7 +13,12 @@ vi.mock('nanoclaw-webchat', () => ({
 }));
 
 import { readEnvFile } from '../env.js';
-import { getRegisteredChannelNames, getActiveAdapters, initChannelAdapters, teardownChannelAdapters } from './channel-registry.js';
+import {
+  getRegisteredChannelNames,
+  getActiveAdapters,
+  initChannelAdapters,
+  teardownChannelAdapters,
+} from './channel-registry.js';
 import { resolveWebchatPort } from './web.js';
 import './index.js';
 import './web.js';

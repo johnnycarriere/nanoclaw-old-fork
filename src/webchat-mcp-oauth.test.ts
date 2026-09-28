@@ -10,6 +10,7 @@ vi.mock('./config.js', async () => {
 import { authConfigForTests } from './webchat-auth-config.js';
 import {
   createWebchatMcpOAuthBackend,
+  MCP_CONSENT_PATH,
   MCP_DEFAULT_SCOPE,
   MCP_OAUTH_CLIENT_TTL_SECONDS,
   mcpRedirectUriMatches,
@@ -60,30 +61,48 @@ function backend() {
   });
 }
 
+type Req = import('node:http').IncomingMessage;
+
+function sessionReq(cookie: string, originalUrl = '/authorize'): Req {
+  return {
+    originalUrl,
+    headers: { cookie: `${WEBCHAT_SESSION_COOKIE}=${encodeURIComponent(cookie)}` },
+  } as unknown as Req;
+}
+
+function aliceCookie(): string {
+  const session = createSession({ userId: 'web:basic:alice', displayName: 'Alice', authMethod: 'basic' }, 3600);
+  return signSessionCookie(session.id, SESSION_SECRET);
+}
+
+/** Full consent round-trip: authorize → consent page → CSRF-checked approve → code. */
 async function mintCode(opts?: { challenge?: string; redirectUri?: string }) {
   const b = backend();
-  const client = await b.clientsStore.registerClient({
+  const client = await b.registerClient({
     redirect_uris: [REDIRECT],
     token_endpoint_auth_method: 'none',
+    client_name: 'Test client',
   });
-  const session = createSession({ userId: 'web:basic:alice', displayName: 'Alice', authMethod: 'basic' }, 3600);
-  const cookie = signSessionCookie(session.id, SESSION_SECRET);
+  const cookie = aliceCookie();
   const codeChallenge = opts?.challenge ?? crypto.createHash('sha256').update('verifier').digest('base64url');
-  const redirect = b.authorize(
-    {
-      originalUrl: '/authorize',
-      headers: { cookie: `${WEBCHAT_SESSION_COOKIE}=${encodeURIComponent(cookie)}` },
-    } as unknown as import('node:http').IncomingMessage,
-    client,
-    {
-      scopes: [MCP_DEFAULT_SCOPE],
-      codeChallenge,
-      redirectUri: opts?.redirectUri ?? REDIRECT,
-      resource: RESOURCE_URL,
-    },
-  );
-  const code = new URL(redirect.location).searchParams.get('code')!;
-  return { backend: b, client, code, codeChallenge };
+  const redirect = b.authorize(sessionReq(cookie), client, {
+    scopes: [MCP_DEFAULT_SCOPE],
+    codeChallenge,
+    redirectUri: opts?.redirectUri ?? REDIRECT,
+    resource: RESOURCE_URL,
+    state: 'xyz',
+  });
+  const consentUrl = new URL(redirect.location, PUBLIC_BASE);
+  expect(consentUrl.pathname).toBe(MCP_CONSENT_PATH);
+  const consentId = consentUrl.searchParams.get('id')!;
+  const pending = b.getPendingConsent(sessionReq(cookie), consentId)!;
+  expect(pending).toMatchObject({ clientName: 'Test client', redirectUri: opts?.redirectUri ?? REDIRECT });
+  const decision = b.decideConsent(sessionReq(cookie), consentId, pending.csrfToken, true);
+  if (decision.type !== 'redirect') throw new Error(`consent failed: ${decision.message}`);
+  const target = new URL(decision.location);
+  expect(target.searchParams.get('state')).toBe('xyz');
+  const code = target.searchParams.get('code')!;
+  return { backend: b, client, code, codeChallenge, cookie };
 }
 
 describe('webchat-mcp-oauth', () => {
@@ -121,6 +140,67 @@ describe('webchat-mcp-oauth', () => {
       expiresAt: expect.any(Number),
     });
     expect(user!.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  it('never issues a code on authorize: requires consent POST with a session-bound CSRF token', async () => {
+    const b = backend();
+    const client = await b.registerClient({ redirect_uris: [REDIRECT], token_endpoint_auth_method: 'none' });
+    const cookie = aliceCookie();
+    const redirect = b.authorize(sessionReq(cookie), client, {
+      scopes: [MCP_DEFAULT_SCOPE],
+      codeChallenge: 'abc',
+      redirectUri: REDIRECT,
+    });
+    // Authorize redirects to the same-origin consent page, not the client redirect_uri.
+    expect(redirect.location.startsWith(MCP_CONSENT_PATH)).toBe(true);
+    expect(redirect.location).not.toContain('code=');
+    const consentId = new URL(redirect.location, PUBLIC_BASE).searchParams.get('id')!;
+
+    // Another browser session cannot see or decide the consent.
+    const otherCookie = aliceCookie();
+    expect(b.getPendingConsent(sessionReq(otherCookie), consentId)).toBeNull();
+    expect(b.decideConsent(sessionReq(otherCookie), consentId, 'anything', true)).toMatchObject({
+      type: 'error',
+      status: 400,
+    });
+    // Unauthenticated POST is rejected.
+    expect(b.decideConsent({ headers: {} } as unknown as Req, consentId, 'anything', true)).toMatchObject({
+      type: 'error',
+      status: 401,
+    });
+    // Wrong CSRF token is rejected and does not consume the consent.
+    expect(b.decideConsent(sessionReq(cookie), consentId, 'wrong-token', true)).toMatchObject({
+      type: 'error',
+      status: 403,
+    });
+    const pending = b.getPendingConsent(sessionReq(cookie), consentId)!;
+    expect(pending.csrfToken).toBeTruthy();
+
+    // Deny redirects back with access_denied and consumes the consent.
+    const denied = b.decideConsent(sessionReq(cookie), consentId, pending.csrfToken, false);
+    expect(denied.type).toBe('redirect');
+    if (denied.type === 'redirect') {
+      const target = new URL(denied.location);
+      expect(target.origin + target.pathname).toBe(REDIRECT);
+      expect(target.searchParams.get('error')).toBe('access_denied');
+      expect(target.searchParams.get('code')).toBeNull();
+    }
+    expect(b.getPendingConsent(sessionReq(cookie), consentId)).toBeNull();
+  });
+
+  it('disables dynamic client registration unless explicitly allowed', () => {
+    const closed = backend();
+    expect(closed.allowDynamicClientRegistration).toBe(false);
+    expect(closed.clientsStore.registerClient).toBeUndefined();
+
+    const open = createWebchatMcpOAuthBackend({
+      publicAuth: publicAuthConfig(),
+      publicBaseUrl: PUBLIC_BASE,
+      resourceServerUrl: RESOURCE_URL,
+      allowDynamicClientRegistration: true,
+    });
+    expect(open.allowDynamicClientRegistration).toBe(true);
+    expect(typeof open.clientsStore.registerClient).toBe('function');
   });
 
   it('redirects unauthenticated authorize requests to login', () => {
@@ -210,7 +290,7 @@ describe('webchat-mcp-oauth', () => {
 
   it('purges stale oauth clients', async () => {
     const b = backend();
-    await b.clientsStore.registerClient({
+    await b.registerClient({
       client_id: 'old-client',
       client_id_issued_at: Math.floor(Date.now() / 1000) - MCP_OAUTH_CLIENT_TTL_SECONDS - 10,
       redirect_uris: [REDIRECT],

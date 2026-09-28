@@ -7,13 +7,39 @@ function workspaceRoot(): string {
 }
 
 // Anthropic Messages API documents 5MB / image (base64-encoded). The base64
-// payload is ~33% larger than the raw bytes, so we cap raw size below the
-// limit (5 * 1024 * 1024 / 1.34 ≈ 3.9MB) to leave headroom.
-const MAX_RAW_IMAGE_BYTES = 3_900_000;
+// payload is ~33% larger than the raw bytes, so we cap raw size well below
+// the limit (3.5MB raw ≈ 4.7MB base64) to leave headroom. No sharp/resize
+// step exists in the agent-runner image, so this is the only per-image bound.
+export const MAX_RAW_IMAGE_BYTES = 3_500_000;
+
+/**
+ * Per-prompt image budget. Every inlined image lands verbatim in the SDK's
+ * on-disk transcript, so a batch of many large photos would both blow the
+ * API request size and bloat the resume path. Past either cap the formatter
+ * falls back to the `[image: name — saved to /workspace/…]` path marker and
+ * the agent can still Read the file.
+ */
+export const MAX_IMAGES_PER_PROMPT = 20;
+export const MAX_IMAGE_BYTES_PER_PROMPT = 15_000_000;
 
 export interface ImageContent {
   mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
   data: string;
+  /** Raw (pre-base64) size in bytes — what the per-prompt budget counts. */
+  bytes: number;
+}
+
+/** Raw bytes already inlined onto a sink, for the per-prompt budget. */
+export function imageBudgetUsed(images: ImageContent[]): number {
+  return images.reduce((sum, img) => sum + img.bytes, 0);
+}
+
+/**
+ * True when one more image of `bytes` raw size still fits the per-prompt
+ * budget alongside what is already on the sink.
+ */
+export function fitsImageBudget(images: ImageContent[], bytes: number): boolean {
+  return images.length < MAX_IMAGES_PER_PROMPT && imageBudgetUsed(images) + bytes <= MAX_IMAGE_BYTES_PER_PROMPT;
 }
 
 /**
@@ -80,5 +106,5 @@ export function loadImageAttachment(localPath: string): ImageContent | null {
   const mediaType = sniffImageMime(buf);
   if (!mediaType) return null;
 
-  return { mediaType, data: buf.toString('base64') };
+  return { mediaType, data: buf.toString('base64'), bytes: buf.length };
 }

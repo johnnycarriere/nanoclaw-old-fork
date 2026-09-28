@@ -1,7 +1,6 @@
 import { registerProvider } from './provider-registry.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
-import { promptToText } from './types.js';
 
 /**
  * Mock provider for testing. Returns canned responses.
@@ -67,7 +66,7 @@ export class MockProvider implements AgentProvider {
 
         // Process initial prompt
         yield { type: 'activity' };
-        yield* turnEvents(promptToText(input.prompt));
+        yield* turnEvents(input.prompt);
 
         // Process any pushed follow-ups
         while (!ended && !aborted) {

@@ -493,3 +493,191 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(msg.markdown).toBe('plain hello');
   });
 });
+
+describe('createChatSdkBridge — send_card callback buttons (index registry, click re-injection)', () => {
+  // Telegram caps callback_data at 64 bytes and the adapter throws
+  // ValidationError for the whole card when a value overflows it. Buttons
+  // therefore carry `ncs:<cardId>` + an index, resolved on click exactly like
+  // ask_question's ncq buttons. The click test drives the bridge's real
+  // onAction handler through the real Chat SDK dispatch (chat.processAction),
+  // capturing the Chat instance from the (mocked) webhook registration.
+  beforeEach(async () => {
+    const { initTestDb } = await import('../db/connection.js');
+    const { runMigrations } = await import('../db/migrations/index.js');
+    await runMigrations(await initTestDb());
+    const { registerWebhookAdapter } = await import('../webhook-server.js');
+    vi.mocked(registerWebhookAdapter).mockClear();
+  });
+
+  afterEach(async () => {
+    const { closeDb } = await import('../db/connection.js');
+    await closeDb();
+  });
+
+  it('encodes long action values as a short card id + index (fits the 64-byte callback cap)', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
+    const longValue = `+perspective ${'x'.repeat(200)}`;
+    await bridge.deliver('telegram:123', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: { title: 'Card', actions: [{ label: 'Add', value: longValue }, { label: 'Skip' }] },
+      },
+    });
+    const msg = calls[0].message as {
+      card?: { children?: Array<{ type?: string; children?: Array<{ id?: string; value?: string }> }> };
+    };
+    const buttons = msg.card?.children?.find((c) => c.type === 'actions')?.children ?? [];
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].id).toMatch(/^ncs:[0-9a-f]{8}$/);
+    expect(buttons[0].id).toBe(buttons[1].id);
+    expect(buttons.map((b) => b.value)).toEqual(['0', '1']);
+    const payload = `chat:${JSON.stringify({ a: buttons[0].id, v: buttons[0].value })}`;
+    expect(Buffer.byteLength(payload, 'utf8')).toBeLessThanOrEqual(64);
+  });
+
+  it('a click resolves the index back to the value and re-injects it as a mention with a stable id; double-clicks dedupe', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const adapter = stubAdapter({
+      name: 'telegram',
+      initialize: async () => {},
+      channelIdFromThreadId: (threadId: string) => threadId,
+      postMessage,
+    });
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: false });
+    const inbound = vi.fn();
+    await bridge.setup({ onInbound: inbound, onInboundEvent: () => {}, onMetadata: () => {}, onAction: () => {} });
+    const { registerWebhookAdapter } = await import('../webhook-server.js');
+    const chat = vi.mocked(registerWebhookAdapter).mock.calls[0][0] as import('chat').Chat;
+
+    const longValue = `+perspective ${'y'.repeat(200)}`;
+    await bridge.deliver('telegram:-100555', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: { title: 'Card', actions: [{ label: 'Skip' }, { label: 'Add', value: longValue }] },
+      },
+    });
+    const msg = calls[0].message as {
+      card?: { children?: Array<{ type?: string; children?: Array<{ id?: string; value?: string }> }> };
+    };
+    const buttons = msg.card?.children?.find((c) => c.type === 'actions')?.children ?? [];
+    const click = {
+      actionId: buttons[1].id!,
+      adapter,
+      messageId: 'card-msg-9',
+      raw: { message: { chat: { type: 'supergroup' } } },
+      threadId: 'telegram:-100555',
+      user: { userId: '7' } as never,
+      value: buttons[1].value,
+    };
+    await chat.processAction(click, undefined);
+    await chat.processAction(click, undefined);
+
+    expect(inbound).toHaveBeenCalledTimes(1);
+    const [channelId, threadId, message] = inbound.mock.calls[0];
+    expect(channelId).toBe('telegram:-100555');
+    expect(threadId).toBe('telegram:-100555');
+    expect(message.content).toEqual({ text: longValue, author: { userId: '7' } });
+    expect(message.isMention).toBe(true);
+    expect(message.isGroup).toBe(true);
+    expect(message.id).toMatch(/^card-msg-9:[0-9a-f]{12}$/);
+    await bridge.teardown();
+  });
+
+  it('legacy bare `ncs` clicks (cards sent before the registry) still re-inject the literal value', async () => {
+    const adapter = stubAdapter({
+      name: 'slack',
+      initialize: async () => {},
+      channelIdFromThreadId: (threadId: string) => threadId,
+    });
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: false });
+    const inbound = vi.fn();
+    await bridge.setup({ onInbound: inbound, onInboundEvent: () => {}, onMetadata: () => {}, onAction: () => {} });
+    const { registerWebhookAdapter } = await import('../webhook-server.js');
+    const chat = vi.mocked(registerWebhookAdapter).mock.calls[0][0] as import('chat').Chat;
+    await chat.processAction(
+      {
+        actionId: 'ncs',
+        adapter,
+        messageId: 'old-1',
+        raw: {},
+        threadId: 'D1',
+        user: { userId: '7' } as never,
+        value: 'Add',
+      },
+      undefined,
+    );
+    expect(inbound).toHaveBeenCalledTimes(1);
+    expect(inbound.mock.calls[0][2].content).toEqual({ text: 'Add', author: { userId: '7' } });
+    expect(inbound.mock.calls[0][2].isGroup).toBeUndefined();
+    await bridge.teardown();
+  });
+
+  it('teardown stops a polling adapter before shutting the Chat instance down', async () => {
+    const order: string[] = [];
+    const adapter = stubAdapter({
+      name: 'telegram',
+      initialize: async () => {},
+      channelIdFromThreadId: (threadId: string) => threadId,
+    }) as Adapter & { stopPolling?: () => Promise<void>; runtimeMode?: string };
+    adapter.runtimeMode = 'polling';
+    adapter.stopPolling = async () => {
+      order.push('stopPolling');
+    };
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: false });
+    await bridge.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction: () => {} });
+    await bridge.teardown();
+    expect(order).toEqual(['stopPolling']);
+  });
+});
+
+describe('createChatSdkBridge.deliver — markdown parse-error fallback', () => {
+  function parseError(): Error {
+    const err = new Error("Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 12");
+    err.name = 'ValidationError';
+    return err;
+  }
+
+  it("retries a chunk as raw text when the platform rejects it with can't parse entities", async () => {
+    const posted: AdapterPostableMessage[] = [];
+    let first = true;
+    const postMessage = async (threadId: string, message: AdapterPostableMessage): Promise<RawMessage<unknown>> => {
+      posted.push(message);
+      if (first) {
+        first = false;
+        throw parseError();
+      }
+      return { id: 'plain-1', threadId, raw: {} };
+    };
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
+    const id = await bridge.deliver('telegram:123', null, { kind: 'chat-sdk', content: { markdown: 'a_b *c' } });
+    expect(id).toBe('plain-1');
+    expect(posted).toEqual([{ markdown: 'a_b *c' }, { raw: 'a_b *c' }]);
+  });
+
+  it('other errors still propagate (delivery retry path), and a second parse failure is not retried again', async () => {
+    const postMessage = async (): Promise<RawMessage<unknown>> => {
+      throw new Error('network down');
+    };
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({ postMessage }), supportsThreads: false });
+    await expect(bridge.deliver('telegram:123', null, { kind: 'chat-sdk', content: { text: 'x' } })).rejects.toThrow(
+      /network down/,
+    );
+
+    let calls = 0;
+    const alwaysParseError = async (): Promise<RawMessage<unknown>> => {
+      calls++;
+      throw parseError();
+    };
+    const bridge2 = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage: alwaysParseError }),
+      supportsThreads: false,
+    });
+    await expect(bridge2.deliver('telegram:123', null, { kind: 'chat-sdk', content: { text: 'x' } })).rejects.toThrow(
+      /parse entities/,
+    );
+    expect(calls).toBe(2);
+  });
+});

@@ -8,8 +8,8 @@
  * wrapper). The result in the UI: eyes → typing-person → thumbs-up, in
  * sync with the real container lifecycle.
  *
- * State is persisted in the central DB (`host_reaction_state`, migration
- * 014) — *not* in-memory. This is load-bearing: `processing_ack` rows
+ * State is persisted in the central DB (`host_reaction_state`, module
+ * migration registered below) — *not* in-memory. This is load-bearing: `processing_ack` rows
  * accumulate forever (the container never deletes 'completed' rows; the
  * host's `clearStaleProcessingAcks` only clears 'processing'). With an
  * in-memory map any host restart, container compaction, or sweep tick
@@ -26,15 +26,79 @@
  */
 import type Database from 'better-sqlite3';
 
-import { getChannelAdapter } from './channels/channel-registry.js';
+import { getChannelAdapter, getChannelAdapterExact } from './channels/channel-registry.js';
 import { getDb } from './db/connection.js';
+import { registerMigration } from './db/migrations/index.js';
 import { log } from './log.js';
+
+// FORK: the durable "already emitted" record. Registered as a module
+// migration (keeps src/db/migrations/index.ts un-diffed vs upstream).
+// Idempotent DDL: installs that applied the pre-module 'host-reaction-state'
+// entry re-run this harmlessly and pick up the module-qualified name.
+registerMigration({
+  version: 14,
+  name: 'module:fork:host-reaction-state',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS host_reaction_state (
+        message_id   TEXT PRIMARY KEY,
+        last_emitted TEXT NOT NULL CHECK (last_emitted IN ('processing', 'completed')),
+        updated_at   TEXT NOT NULL
+      );
+    `);
+  },
+});
 
 type EmittedStatus = 'processing' | 'completed';
 
 interface AckRow {
   message_id: string;
   status: 'processing' | 'completed' | 'failed';
+  status_changed: string;
+}
+
+export interface StatusReactionContext {
+  /** Watermark key. Acks whose status_changed predates the last one seen for this key are skipped. */
+  sessionId?: string;
+  /** Composite inbound ids end in `:<agentGroupId>`; stripped to reach the platform id. */
+  agentGroupId?: string;
+  /** Messaging-group adapter instance; null/undefined falls back to channel type. */
+  instance?: string | null;
+}
+
+// Per-session high-water mark of processing_ack.status_changed already
+// examined (inclusive — the state table dedupes same-second neighbours).
+// Seeded once per process from host_reaction_state so a restart does not
+// re-walk the whole ack table; slack covers an ack that flipped between the
+// read and the state write of the last pre-restart sweep.
+const watermarks = new Map<string, string>();
+const WATERMARK_SEED_SLACK_MS = 10 * 60 * 1000;
+const PRUNE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+let lastPruneAt = 0;
+
+async function seedWatermark(key: string): Promise<string | undefined> {
+  if (watermarks.has(key)) return watermarks.get(key);
+  const row = await getDb().get<{ m: string | null }>('SELECT MAX(updated_at) AS m FROM host_reaction_state');
+  const seed = row?.m ? new Date(new Date(row.m).getTime() - WATERMARK_SEED_SLACK_MS).toISOString() : undefined;
+  if (seed) watermarks.set(key, seed);
+  return seed;
+}
+
+async function pruneReactionState(): Promise<void> {
+  const now = Date.now();
+  if (now - lastPruneAt < PRUNE_INTERVAL_MS) return;
+  lastPruneAt = now;
+  await getDb().run(
+    'DELETE FROM host_reaction_state WHERE updated_at < ?',
+    new Date(now - PRUNE_AFTER_MS).toISOString(),
+  );
+}
+
+/** Test seam: forget per-session watermarks. */
+export function resetStatusReactionWatermarks(): void {
+  watermarks.clear();
+  lastPruneAt = 0;
 }
 
 interface InMsgRow {
@@ -93,9 +157,26 @@ const UPSERT_STATE_SQL = `INSERT INTO host_reaction_state (message_id, last_emit
  * Called after the sweep has applied processing acks so we're looking at
  * the current, canonical state.
  */
-export async function emitStatusReactions(inDb: Database.Database, outDb: Database.Database): Promise<void> {
-  const rows = outDb.prepare('SELECT message_id, status FROM processing_ack').all() as AckRow[];
+export async function emitStatusReactions(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  ctx: StatusReactionContext = {},
+): Promise<void> {
+  const key = ctx.sessionId ?? '';
+  const since = await seedWatermark(key);
+  const rows = (
+    since
+      ? outDb
+          .prepare(
+            'SELECT message_id, status, status_changed FROM processing_ack WHERE datetime(status_changed) >= datetime(?)',
+          )
+          .all(since)
+      : outDb.prepare('SELECT message_id, status, status_changed FROM processing_ack').all()
+  ) as AckRow[];
+  await pruneReactionState();
   if (rows.length === 0) return;
+  const maxSeen = rows.reduce((m, r) => (r.status_changed > m ? r.status_changed : m), rows[0].status_changed);
+  watermarks.set(key, maxSeen);
 
   const ids = rows.map((r) => r.message_id);
 
@@ -121,10 +202,10 @@ export async function emitStatusReactions(inDb: Database.Database, outDb: Databa
     if (!inMsg) continue;
 
     if (row.status === 'processing' && last !== 'processing' && last !== 'completed') {
-      await fireReaction(inMsg, '👨‍💻');
+      await fireReaction(inMsg, '👨‍💻', ctx);
       await centralDb.run(UPSERT_STATE_SQL, row.message_id, 'processing', new Date().toISOString());
     } else if ((row.status === 'completed' || row.status === 'failed') && last !== 'completed') {
-      await fireReaction(inMsg, '👍');
+      await fireReaction(inMsg, '👍', ctx);
       await centralDb.run(UPSERT_STATE_SQL, row.message_id, 'completed', new Date().toISOString());
     }
   }
@@ -163,13 +244,33 @@ export async function backfillReactionStateFromOutDb(outDb: Database.Database): 
   });
 }
 
-async function fireReaction(inMsg: InMsgRow, emoji: string): Promise<void> {
-  const adapter = getChannelAdapter(inMsg.channel_type);
+/**
+ * Platform-native message id from the composite inbound id
+ * `<platform message id>:<agentGroupId>` (router.ts). Telegram platform ids
+ * are `<chat>:<msgId>`; an id with no `:` after the suffix strip is another
+ * platform's opaque id and yields undefined (no reaction).
+ */
+export function nativeMessageId(compositeId: string, agentGroupId?: string): string | undefined {
+  let platformPart: string;
+  if (agentGroupId !== undefined) {
+    const suffix = `:${agentGroupId}`;
+    if (!compositeId.endsWith(suffix)) return undefined;
+    platformPart = compositeId.slice(0, -suffix.length);
+  } else {
+    const at = compositeId.lastIndexOf(':');
+    if (at === -1) return undefined;
+    platformPart = compositeId.slice(0, at);
+  }
+  const at = platformPart.lastIndexOf(':');
+  if (at === -1) return undefined;
+  return platformPart.slice(at + 1) || undefined;
+}
+
+async function fireReaction(inMsg: InMsgRow, emoji: string, ctx: StatusReactionContext): Promise<void> {
+  const adapter = ctx.instance ? getChannelAdapterExact(ctx.instance) : getChannelAdapter(inMsg.channel_type);
   if (!adapter?.postReaction) return;
-  // Extract the platform-native message id from our composite id.
-  // Format: `<chat>:<msgId>:<agentGroupId>`. We need the middle segment.
-  const parts = inMsg.id.split(':');
-  const nativeMsgId = parts.length >= 2 ? parts[1] : inMsg.id;
+  const nativeMsgId = nativeMessageId(inMsg.id, ctx.agentGroupId);
+  if (!nativeMsgId) return;
   try {
     await adapter.postReaction(inMsg.platform_id, nativeMsgId, emoji);
   } catch (err) {

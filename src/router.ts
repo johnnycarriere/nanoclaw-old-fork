@@ -37,6 +37,10 @@ import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
+// FORK: override the channel-declared unknown-sender default for auto-created
+// messaging groups. `null` restores upstream's declaration-driven resolution.
+const FORK_DEFAULT_UNKNOWN_SENDER_POLICY: MessagingGroup['unknown_sender_policy'] | null = 'strict';
+
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -261,10 +265,17 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       instance: event.instance ?? event.channelType,
       name: null,
       is_group: event.message.isGroup ? 1 : 0,
-      // Local override: always default to 'strict' regardless of the
-      // channel's declared defaults (upstream resolves via
-      // resolveUnknownSenderPolicy with a 'request_approval' fallback).
-      unknown_sender_policy: 'strict',
+      // Policy from the receiving channel's declared defaults (DM vs group
+      // context); undeclared adapters resolve through the behavior-faithful
+      // fallback, which is 'request_approval' in both contexts — identical
+      // to the historical hardcode.
+      unknown_sender_policy:
+        FORK_DEFAULT_UNKNOWN_SENDER_POLICY ?? // FORK: every auto-created group defaults to 'strict'
+        resolveUnknownSenderPolicy(
+          event.instance ?? event.channelType,
+          event.message.isGroup === true,
+          event.channelType,
+        ),
       denied_at: null,
       created_at: new Date().toISOString(),
     };

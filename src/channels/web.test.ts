@@ -169,7 +169,7 @@ import {
   rewriteWebchatPublicPaths,
   shouldMirrorApprovalToOrigin,
 } from './web.js';
-import type { ChannelSetup, InboundMessage } from './adapter.js';
+import type { ChannelSetup } from './adapter.js';
 import { routeInbound } from '../router.js';
 import { cleanupAgentSessionsForThread } from '../webchat-thread-cleanup.js';
 import { getDb, hasTable } from '../db/connection.js';
@@ -188,7 +188,13 @@ import {
   signSessionCookie,
   WEBCHAT_SESSION_COOKIE,
 } from '../webchat-auth-sessions.js';
-import { createWebchatMcpOAuthBackend, MCP_DEFAULT_SCOPE, verifyMcpAccessToken } from '../webchat-mcp-oauth.js';
+import { resetLoginRateLimitForTests } from '../webchat-auth.js';
+import {
+  createWebchatMcpOAuthBackend,
+  MCP_CONSENT_PATH,
+  MCP_DEFAULT_SCOPE,
+  verifyMcpAccessToken,
+} from '../webchat-mcp-oauth.js';
 import { encodeUserSuffix } from '../webchat-room-scope.js';
 import * as webchatRoomScope from '../webchat-room-scope.js';
 import { isOwner, isGlobalAdmin, hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
@@ -660,6 +666,7 @@ describe('web channel adapter', () => {
   beforeEach(async () => {
     clearWebAdapterTestState();
     resetUploadStateForTests();
+    resetLoginRateLimitForTests();
     captures.length = 0;
     actionCaptures.length = 0;
     getDbMock.mockReset();
@@ -814,6 +821,31 @@ describe('web channel adapter', () => {
     });
   });
 
+  it('serves html attachments as text/plain downloads, never as a page', async () => {
+    await adapter.setup(setup);
+    const posted = await httpPostJson('/api/rooms/lobby/threads/main/messages', {
+      text: 'see attached',
+      attachments: [
+        {
+          name: 'page.html',
+          mimeType: 'text/html',
+          type: 'file',
+          data: Buffer.from('<script>alert(document.cookie)</script>').toString('base64'),
+        },
+      ],
+    });
+    expect(posted.status).toBe(200);
+    const url = (posted.body as { attachments: Array<{ url: string }> }).attachments[0]!.url;
+
+    const res = await httpGetWithHeaders(`${url}?token=${SECRET}`, {});
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('text/plain; charset=utf-8');
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename="page\.html"/);
+    expect(res.headers['content-security-policy']).toBe('sandbox');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(String(res.body)).toContain('<script>');
+  });
+
   it('accepts non-image inbound attachments such as PDF', async () => {
     await adapter.setup(setup);
     const status = await httpPost('/api/rooms/lobby/threads/thread_abc/messages', {
@@ -857,11 +889,13 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', 'thread_abc', {
-          kind: 'chat',
-          content: { text: 'Agent reply' },
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', 'thread_abc', {
+            kind: 'chat',
+            content: { text: 'Agent reply' },
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -884,11 +918,13 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', 'thread_abc', {
-          kind: 'chat',
-          content: { text: 'On it', senderName: 'Diego' },
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', 'thread_abc', {
+            kind: 'chat',
+            content: { text: 'On it', senderName: 'Diego' },
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -910,12 +946,14 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', 'thread_abc', {
-          kind: 'chat',
-          content: { text: 'Here is the chart' },
-          files: [{ filename: 'chart.png', data: Buffer.from('fake-png') }],
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', 'thread_abc', {
+            kind: 'chat',
+            content: { text: 'Here is the chart' },
+            files: [{ filename: 'chart.png', data: Buffer.from('fake-png') }],
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -948,12 +986,14 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', 'thread_abc', {
-          kind: 'chat',
-          content: { text: '' },
-          files: [{ filename: 'report.pdf', data: Buffer.from('%PDF-1.4') }],
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', 'thread_abc', {
+            kind: 'chat',
+            content: { text: '' },
+            files: [{ filename: 'report.pdf', data: Buffer.from('%PDF-1.4') }],
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -1175,8 +1215,10 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await httpPost('/api/rooms/lobby/threads/thread_abc/messages', { text: '@sarah hello' });
+      ws.on('open', () => {
+        void (async () => {
+          await httpPost('/api/rooms/lobby/threads/thread_abc/messages', { text: '@sarah hello' });
+        })();
       });
       ws.on('message', (data) => {
         const event = JSON.parse(data.toString()) as { type: string };
@@ -1425,8 +1467,10 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.setTyping!('lobby', 'thread_abc');
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.setTyping!('lobby', 'thread_abc');
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -2597,8 +2641,10 @@ describe('web channel adapter', () => {
     await adapter.setup(setup);
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.setTyping!('lobby', null);
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.setTyping!('lobby', null);
+        })();
       });
       ws.on('message', (data) => {
         const event = JSON.parse(data.toString()) as { type: string; threadId: string };
@@ -3183,20 +3229,22 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('inbox', null, {
-          kind: 'chat-sdk',
-          content: {
-            type: 'ask_question',
-            questionId: 'approval-1',
-            title: 'Install MCP server',
-            question: 'Add memory server?',
-            options: [
-              { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
-              { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
-            ],
-          },
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('inbox', null, {
+            kind: 'chat-sdk',
+            content: {
+              type: 'ask_question',
+              questionId: 'approval-1',
+              title: 'Install MCP server',
+              question: 'Add memory server?',
+              options: [
+                { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+                { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+              ],
+            },
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -3555,8 +3603,10 @@ describe('web channel adapter', () => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws`, {
         headers: { Cookie: cookie },
       });
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', null, { kind: 'chat', content: 'lobby hello' });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', null, { kind: 'chat', content: 'lobby hello' });
+        })();
       });
       ws.on('message', (data) => {
         events.push(JSON.parse(String(data)));
@@ -3699,7 +3749,7 @@ describe('web channel adapter', () => {
     expect(font.body).toBe('font');
   });
 
-  it('accepts bearer token for bootstrap when session is absent in public mode', async () => {
+  it('ignores the static WEBCHAT_SECRET entirely in public mode', async () => {
     adapter = createWebAdapter(publicAdapterOptions(testPort));
     resetWebchatAuthSchemaForTests();
     await adapter.setup(setup);
@@ -3707,11 +3757,67 @@ describe('web channel adapter', () => {
     const bootstrap = await httpGetWithHeaders('/api/bootstrap', {
       Authorization: `Bearer ${SECRET}`,
     });
-    expect(bootstrap.status).toBe(200);
-    expect(bootstrap.body).toMatchObject({
-      authMode: 'public',
-      user: { id: 'web:local', displayName: 'Local' },
-    });
+    expect(bootstrap.status).toBe(401);
+
+    const viaQuery = await httpGetWithHeaders(`/api/bootstrap?token=${SECRET}`, {});
+    expect(viaQuery.status).toBe(401);
+
+    const attachment = await httpGetWithHeaders(`/api/attachments/missing/file.png?token=${SECRET}`, {});
+    expect(attachment.status).toBe(401);
+
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
+        ws.on('open', () => {
+          ws.close();
+          resolve();
+        });
+        ws.on('error', reject);
+      }),
+    ).rejects.toThrow(/401/);
+
+    // A real session still works.
+    const cookie = await loginBasicSession('alice');
+    const ok = await httpGetWithHeaders('/api/bootstrap', { Cookie: cookie });
+    expect(ok.status).toBe(200);
+  });
+
+  it('rejects WebSocket upgrades whose Origin does not match the public base URL', async () => {
+    adapter = createWebAdapter(publicAdapterOptions(testPort));
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+    const cookie = await loginBasicSession('alice');
+
+    const tryOrigin = (origin: string) =>
+      new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws`, { headers: { Cookie: cookie, Origin: origin } });
+        ws.on('open', () => {
+          ws.close();
+          resolve();
+        });
+        ws.on('error', reject);
+      });
+
+    await expect(tryOrigin('https://evil.example')).rejects.toThrow(/403/);
+    await expect(tryOrigin(`http://127.0.0.1:${testPort + 1}`)).rejects.toThrow(/403/);
+    await expect(tryOrigin(`http://127.0.0.1:${testPort}`)).resolves.toBeUndefined();
+  });
+
+  it('rejects WebSocket upgrades from non-loopback Origins in local mode', async () => {
+    await adapter.setup(setup);
+    const tryOrigin = (origin: string) =>
+      new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`, { headers: { Origin: origin } });
+        ws.on('open', () => {
+          ws.close();
+          resolve();
+        });
+        ws.on('error', reject);
+      });
+    await expect(tryOrigin('http://attacker.example')).rejects.toThrow(/403/);
+    await expect(tryOrigin('not a url')).rejects.toThrow(/403/);
+    await expect(tryOrigin(`http://localhost:${testPort}`)).resolves.toBeUndefined();
+    await expect(tryOrigin(`http://127.0.0.1:${testPort}`)).resolves.toBeUndefined();
   });
 
   it('broadcasts message_update over session-scoped WebSocket in public mode', async () => {
@@ -3781,22 +3887,25 @@ describe('web channel adapter', () => {
     expect(messages.some((msg) => msg.text === 'hello from alice')).toBe(true);
   });
 
-  it('does not deliver private-room events to unscoped bearer WebSocket clients in public mode', async () => {
+  it('does not deliver private-room events to other users over WebSocket in public mode', async () => {
     adapter = createWebAdapter(publicAdapterOptions(testPort));
     resetWebchatAuthSchemaForTests();
     await adapter.setup(setup);
 
+    const bobCookie = await loginBasicSession('bob');
     const events: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        const aliceInbox = `inbox:${encodeUserSuffix('web:basic:alice')}`;
-        await adapter.deliver(aliceInbox, null, { kind: 'chat', content: 'via bearer token' });
-        // Give the server a beat to fan out; unscoped clients must receive nothing.
-        setTimeout(() => {
-          ws.close();
-          resolve();
-        }, 50);
+      const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws`, { headers: { Cookie: bobCookie } });
+      ws.on('open', () => {
+        void (async () => {
+          const aliceInbox = `inbox:${encodeUserSuffix('web:basic:alice')}`;
+          await adapter.deliver(aliceInbox, null, { kind: 'chat', content: 'for alice only' });
+          // Give the server a beat to fan out; bob must receive nothing from alice's inbox.
+          setTimeout(() => {
+            ws.close();
+            resolve();
+          }, 50);
+        })();
       });
       ws.on('message', (data) => {
         events.push(JSON.parse(String(data)));
@@ -3850,6 +3959,203 @@ describe('web channel adapter', () => {
     expect(created.body).toMatchObject({ title: 'Public topic' });
   });
 
+  it('only the creator or an owner can delete a lobby thread in public mode', async () => {
+    adapter = createWebAdapter(publicAdapterOptions(testPort));
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+    vi.mocked(isOwner).mockImplementation(async () => false);
+
+    const alice = await loginBasicSession('alice');
+    const bob = await loginBasicSession('bob');
+    const created = await httpPostJsonWithHeaders('/api/rooms/lobby/threads', { title: 'Mine' }, { Cookie: alice });
+    const threadId = (created.body as { id: string }).id;
+
+    const byBob = await httpDeleteWithHeaders(`/api/rooms/lobby/threads/${encodeURIComponent(threadId)}`, {
+      Cookie: bob,
+    });
+    expect(byBob.status).toBe(403);
+    expect(webchatStore.listThreads('lobby').some((t) => t.id === threadId)).toBe(true);
+
+    const byAlice = await httpDeleteWithHeaders(`/api/rooms/lobby/threads/${encodeURIComponent(threadId)}`, {
+      Cookie: alice,
+    });
+    expect(byAlice.status).toBe(200);
+
+    // Owners keep the ability to delete anyone's thread (the operator case).
+    const again = await httpPostJsonWithHeaders('/api/rooms/lobby/threads', { title: 'Mine 2' }, { Cookie: alice });
+    const threadId2 = (again.body as { id: string }).id;
+    vi.mocked(isOwner).mockImplementation(async (userId: string) => userId === 'web:basic:bob');
+    const byOwner = await httpDeleteWithHeaders(`/api/rooms/lobby/threads/${encodeURIComponent(threadId2)}`, {
+      Cookie: bob,
+    });
+    expect(byOwner.status).toBe(200);
+  });
+
+  it('gates attachment downloads by room access in public mode', async () => {
+    adapter = createWebAdapter(publicAdapterOptions(testPort));
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+
+    const alice = await loginBasicSession('alice');
+    const bob = await loginBasicSession('bob');
+    const posted = await httpPostJsonWithHeaders(
+      '/api/rooms/inbox/threads/main/messages',
+      {
+        text: 'private',
+        attachments: [{ name: 'secret.png', mimeType: 'image/png', type: 'image', data: PNG_BASE64 }],
+      },
+      { Cookie: alice },
+    );
+    expect(posted.status).toBe(200);
+    const url = (posted.body as { attachments: Array<{ url: string }> }).attachments[0]!.url;
+    expect(url).toContain('/api/attachments/');
+
+    const asBob = await httpGetWithHeaders(url, { Cookie: bob });
+    expect(asBob.status).toBe(403);
+    const anonymous = await httpGetWithHeaders(url, {});
+    expect(anonymous.status).toBe(401);
+    const asAlice = await httpGetWithHeaders(url, { Cookie: alice });
+    expect(asAlice.status).toBe(200);
+    expect(asAlice.headers['content-disposition']).toMatch(/^attachment; filename="secret\.png"/);
+
+    // Lobby attachments are shared: bob can fetch what alice posted there.
+    const lobbyPost = await httpPostJsonWithHeaders(
+      '/api/rooms/lobby/threads/main/messages',
+      { text: 'shared', attachments: [{ name: 'shared.png', mimeType: 'image/png', type: 'image', data: PNG_BASE64 }] },
+      { Cookie: alice },
+    );
+    const lobbyUrl = (lobbyPost.body as { attachments: Array<{ url: string }> }).attachments[0]!.url;
+    expect((await httpGetWithHeaders(lobbyUrl, { Cookie: bob })).status).toBe(200);
+  });
+
+  it('serves the MCP consent page and issues a code only on a CSRF-checked POST', async () => {
+    adapter = createWebAdapter(publicAdapterOptions(testPort));
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+
+    const opts = publicAdapterOptions(testPort);
+    const resourceServerUrl = new URL('/mcp', `${opts.publicBaseUrl}/`).href;
+    const backend = createWebchatMcpOAuthBackend({
+      publicAuth: opts.publicAuth!,
+      publicBaseUrl: opts.publicBaseUrl!,
+      resourceServerUrl,
+    });
+    const client = await backend.registerClient({
+      redirect_uris: ['http://127.0.0.1:8765/callback'],
+      token_endpoint_auth_method: 'none',
+      client_name: 'Claude Desktop',
+    });
+    const cookie = await loginBasicSession('alice');
+    const codeVerifier = 'consent-verifier';
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+    const redirect = backend.authorize(
+      { originalUrl: '/authorize', headers: { cookie } } as unknown as import('node:http').IncomingMessage,
+      client,
+      {
+        scopes: [MCP_DEFAULT_SCOPE],
+        codeChallenge,
+        redirectUri: 'http://127.0.0.1:8765/callback',
+        resource: resourceServerUrl,
+        state: 's1',
+      },
+    );
+    expect(redirect.location).toMatch(new RegExp(`^${MCP_CONSENT_PATH}\\?id=`));
+
+    // Anonymous: bounced to login with returnTo.
+    const anon = await httpGetWithHeaders(redirect.location, {});
+    expect(anon.status).toBe(302);
+    expect(String(anon.headers.location)).toMatch(/^\/\?returnTo=/);
+
+    // Logged in: consent page with client name, redirect URI, scopes and CSRF token.
+    const page = await httpGetWithHeaders(redirect.location, { Cookie: cookie });
+    expect(page.status).toBe(200);
+    expect(page.headers['content-type']).toContain('text/html');
+    const body = String(page.body);
+    expect(body).toContain('Claude Desktop');
+    expect(body).toContain('http://127.0.0.1:8765/callback');
+    expect(body).toContain(MCP_DEFAULT_SCOPE);
+    const consentId = /name="id" value="([^"]+)"/.exec(body)![1]!;
+    const csrf = /name="csrf" value="([^"]+)"/.exec(body)![1]!;
+
+    const postForm = (form: Record<string, string>, headers: Record<string, string>) =>
+      new Promise<{ status: number; location?: string }>((resolve, reject) => {
+        const payload = new URLSearchParams(form).toString();
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: testPort,
+            path: MCP_CONSENT_PATH,
+            method: 'POST',
+            agent: false,
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Content-Length': Buffer.byteLength(payload),
+              Connection: 'close',
+              ...headers,
+            },
+          },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, location: res.headers.location }));
+          },
+        );
+        req.on('error', reject);
+        req.end(payload);
+      });
+
+    // Wrong CSRF / no session: no code.
+    expect((await postForm({ id: consentId, csrf: 'nope', action: 'approve' }, { Cookie: cookie })).status).toBe(403);
+    expect((await postForm({ id: consentId, csrf, action: 'approve' }, {})).status).toBe(401);
+    const bobCookie = await loginBasicSession('bob');
+    expect((await postForm({ id: consentId, csrf, action: 'approve' }, { Cookie: bobCookie })).status).toBe(400);
+
+    // Valid POST from the owning session: code issued, state echoed.
+    const approved = await postForm({ id: consentId, csrf, action: 'approve' }, { Cookie: cookie });
+    expect(approved.status).toBe(302);
+    const target = new URL(approved.location!);
+    expect(target.origin + target.pathname).toBe('http://127.0.0.1:8765/callback');
+    expect(target.searchParams.get('state')).toBe('s1');
+    const code = target.searchParams.get('code')!;
+    const tokens = await backend.exchangeAuthorizationCode(client, code, resourceServerUrl, {
+      codeVerifier,
+      redirectUri: 'http://127.0.0.1:8765/callback',
+    });
+    expect(
+      verifyMcpAccessToken(tokens.access_token, {
+        publicAuth: opts.publicAuth!,
+        resourceServerUrl,
+        publicBaseUrl: opts.publicBaseUrl,
+      }),
+    ).toMatchObject({
+      userId: 'web:basic:alice',
+    });
+
+    // Consent is single-use.
+    expect((await postForm({ id: consentId, csrf, action: 'approve' }, { Cookie: cookie })).status).toBe(400);
+  });
+
+  it('returns 403 for OAuth dynamic client registration unless explicitly allowed', async () => {
+    adapter = createWebAdapter({ ...publicAdapterOptions(testPort), mcpHttpEnabled: true });
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+    const denied = await httpPostJsonNoAuth('/register', { redirect_uris: ['http://127.0.0.1:1/cb'] });
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ error: 'access_denied' });
+    // Other MCP router paths still reach the delegate (mocked to 204).
+    expect((await httpGetWithHeaders('/.well-known/oauth-authorization-server', {})).status).toBe(204);
+    await adapter.teardown();
+
+    testPort = await reservePort();
+    adapter = createWebAdapter({
+      ...publicAdapterOptions(testPort),
+      mcpHttpEnabled: true,
+      mcpAllowDynamicClientRegistration: true,
+    });
+    await adapter.setup(setup);
+    const allowed = await httpPostJsonNoAuth('/register', { redirect_uris: ['http://127.0.0.1:1/cb'] });
+    expect(allowed.status).toBe(204);
+  });
+
   async function mintMcpAccessToken(username: string): Promise<string> {
     const opts = publicAdapterOptions(testPort);
     const resourceServerUrl = new URL('/mcp', `${opts.publicBaseUrl}/`).href;
@@ -3858,9 +4164,10 @@ describe('web channel adapter', () => {
       publicBaseUrl: opts.publicBaseUrl!,
       resourceServerUrl,
     });
-    const client = await backend.clientsStore.registerClient({
+    const client = await backend.registerClient({
       redirect_uris: ['http://127.0.0.1:8765/callback'],
       token_endpoint_auth_method: 'none',
+      client_name: 'Test MCP client',
     });
     const session = createSession(
       {
@@ -3871,22 +4178,24 @@ describe('web channel adapter', () => {
       3600,
     );
     const cookie = signSessionCookie(session.id, PUBLIC_SESSION_SECRET);
+    const sessionReq = {
+      originalUrl: '/authorize',
+      headers: { cookie: `${WEBCHAT_SESSION_COOKIE}=${encodeURIComponent(cookie)}` },
+    } as unknown as import('node:http').IncomingMessage;
     const codeVerifier = 'test-verifier';
     const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
-    const redirect = backend.authorize(
-      {
-        originalUrl: '/authorize',
-        headers: { cookie: `${WEBCHAT_SESSION_COOKIE}=${encodeURIComponent(cookie)}` },
-      } as unknown as import('node:http').IncomingMessage,
-      client,
-      {
-        scopes: [MCP_DEFAULT_SCOPE],
-        codeChallenge,
-        redirectUri: 'http://127.0.0.1:8765/callback',
-        resource: resourceServerUrl,
-      },
-    );
-    const code = new URL(redirect.location).searchParams.get('code')!;
+    const redirect = backend.authorize(sessionReq, client, {
+      scopes: [MCP_DEFAULT_SCOPE],
+      codeChallenge,
+      redirectUri: 'http://127.0.0.1:8765/callback',
+      resource: resourceServerUrl,
+    });
+    // authorize() never hands out a code: it parks a consent and sends the browser to the consent page.
+    const consentId = new URL(redirect.location, opts.publicBaseUrl).searchParams.get('id')!;
+    const consent = backend.getPendingConsent(sessionReq, consentId)!;
+    const decision = backend.decideConsent(sessionReq, consentId, consent.csrfToken, true);
+    if (decision.type !== 'redirect') throw new Error(decision.message);
+    const code = new URL(decision.location).searchParams.get('code')!;
     const tokens = await backend.exchangeAuthorizationCode(client, code, resourceServerUrl, {
       codeVerifier,
       redirectUri: 'http://127.0.0.1:8765/callback',
@@ -4695,12 +5004,14 @@ describe('web channel adapter', () => {
     const events: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        const status = await httpPost('/api/rooms/dm%3Asarah/threads/main/actions', {
-          questionId: 'approval-sync',
-          value: 'approve',
-        });
-        expect(status).toBe(200);
+      ws.on('open', () => {
+        void (async () => {
+          const status = await httpPost('/api/rooms/dm%3Asarah/threads/main/actions', {
+            questionId: 'approval-sync',
+            value: 'approve',
+          });
+          expect(status).toBe(200);
+        })();
       });
       ws.on('message', (data) => {
         events.push(JSON.parse(data.toString()));

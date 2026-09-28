@@ -20,7 +20,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 import { ONECLI_API_KEY, ONECLI_URL } from '../config.js';
 import type { MountSpec } from '../drivers/types.js';
 import { log } from '../log.js';
-import { onecliDockerNetworkAvailable, rewriteGatewayHostForOnecliNetwork } from '../onecli-network.js';
+import { onecliNetworkJoin, rewriteGatewayHostForOnecliNetwork } from '../onecli-network.js';
 
 import {
   registerGatewayProvider,
@@ -100,8 +100,9 @@ registerGatewayProvider('onecli', () => ({
     // FORK: when the driver joins the OneCLI compose network (Linux), the
     // proxy must be addressed by its in-network name — host.docker.internal
     // is unreachable from there. Pairs with dockerNetworkArgs in drivers/index.ts.
-    if (contribution.env && onecliDockerNetworkAvailable()) {
-      contribution.env = rewriteGatewayHostForOnecliNetwork(contribution.env);
+    const onecliNet = onecliNetworkJoin();
+    if (contribution.env && onecliNet.join) {
+      contribution.env = rewriteGatewayHostForOnecliNetwork(contribution.env, onecliNet.host);
     }
     return contribution;
   },

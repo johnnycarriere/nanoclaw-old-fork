@@ -76,7 +76,8 @@ function verifyJwtSignature(
     return crypto.verify('RSA-SHA256', Buffer.from(signingInput), publicKey, signature);
   }
   if (alg === 'ES256') {
-    return crypto.verify('sha256', Buffer.from(signingInput), publicKey, signature);
+    // JWS ES256 signatures are raw R||S (IEEE P1363), not DER.
+    return crypto.verify('sha256', Buffer.from(signingInput), { key: publicKey, dsaEncoding: 'ieee-p1363' }, signature);
   }
   return false;
 }
@@ -85,7 +86,10 @@ function validateIdTokenClaims(payload: Record<string, unknown>, options: IdToke
   const now = options.nowSeconds ?? Math.floor(Date.now() / 1000);
   const skew = options.clockSkewSeconds ?? 60;
 
-  if (typeof payload.exp === 'number' && payload.exp + skew < now) {
+  if (typeof payload.exp !== 'number') {
+    throw new Error('JWT missing exp');
+  }
+  if (payload.exp + skew < now) {
     throw new Error('JWT expired');
   }
   if (typeof payload.nbf === 'number' && payload.nbf - skew > now) {
@@ -102,11 +106,7 @@ function validateIdTokenClaims(payload: Record<string, unknown>, options: IdToke
 }
 
 /** Verify RS256 or ES256 JWT signature and standard OIDC id_token claims. */
-export function verifyIdToken(
-  jwt: string,
-  keys: JsonWebKey[],
-  options: IdTokenVerifyOptions,
-): Record<string, unknown> {
+export function verifyIdToken(jwt: string, keys: JsonWebKey[], options: IdTokenVerifyOptions): Record<string, unknown> {
   const parts = jwt.split('.');
   if (parts.length !== 3) throw new Error('Invalid JWT');
 
@@ -139,7 +139,6 @@ export function verifyRs256IdToken(
 /** Whether a verification failure may succeed after refreshing JWKS (key rotation). */
 export function isJwksRetryableVerificationError(err: unknown): boolean {
   return (
-    err instanceof Error &&
-    (err.message === 'Invalid JWT signature' || err.message === 'No matching JWK for id_token')
+    err instanceof Error && (err.message === 'Invalid JWT signature' || err.message === 'No matching JWK for id_token')
   );
 }

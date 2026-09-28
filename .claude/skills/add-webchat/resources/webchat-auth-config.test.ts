@@ -18,7 +18,11 @@ const ENV_KEYS = [
   'WEBCHAT_AUTH_BASIC_ENABLED',
   'WEBCHAT_AUTH_OIDC_ENABLED',
   'WEBCHAT_BASIC_PASSWORD',
+  'WEBCHAT_BASIC_USERS',
   'WEBCHAT_BASIC_ALLOWED_USERNAMES',
+  'WEBCHAT_BIND_ADDRESS',
+  'WEBCHAT_MCP_HTTP_ENABLED',
+  'WEBCHAT_MCP_ALLOW_DCR',
   'WEBCHAT_SESSION_SECRET',
   'WEBCHAT_SECURE_COOKIES',
   'WEBCHAT_SESSION_INSECURE_COOKIES',
@@ -86,11 +90,67 @@ describe('loadWebAdapterAuthConfig', () => {
     expect(() => loadWebAdapterAuthConfig()).toThrow(/at least/);
   });
 
-  it('defaults mcpHttpEnabled to true in public mode', () => {
+  it('defaults MCP HTTP and dynamic client registration to off in both modes', () => {
     publicEnv();
-    const cfg = loadWebAdapterAuthConfig();
-    expect(cfg?.mcpHttpEnabled).toBe(true);
+    let cfg = loadWebAdapterAuthConfig();
+    expect(cfg?.mcpHttpEnabled).toBe(false);
+    expect(cfg?.mcpAllowDynamicClientRegistration).toBe(false);
     expect(cfg?.publicBaseUrl).toBe('http://127.0.0.1:3200');
+
+    setEnv('WEBCHAT_AUTH_MODE', 'local');
+    cfg = loadWebAdapterAuthConfig();
+    expect(cfg?.mode).toBe('local');
+    expect(cfg?.mcpHttpEnabled).toBe(false);
+
+    setEnv('WEBCHAT_MCP_HTTP_ENABLED', 'true');
+    setEnv('WEBCHAT_MCP_ALLOW_DCR', 'true');
+    setEnv('WEBCHAT_AUTH_MODE', 'public');
+    cfg = loadWebAdapterAuthConfig();
+    expect(cfg?.mcpHttpEnabled).toBe(true);
+    expect(cfg?.mcpAllowDynamicClientRegistration).toBe(true);
+  });
+
+  it('refuses local mode when bound or published beyond loopback', () => {
+    publicEnv();
+    setEnv('WEBCHAT_AUTH_MODE', 'local');
+    setEnv('WEBCHAT_PUBLIC_BASE_URL', 'https://bawdeclaw.bawapps.com');
+    expect(() => loadWebAdapterAuthConfig()).toThrow(/WEBCHAT_AUTH_MODE=public/);
+
+    setEnv('WEBCHAT_PUBLIC_BASE_URL', 'http://localhost:3200');
+    setEnv('WEBCHAT_BIND_ADDRESS', '0.0.0.0');
+    expect(() => loadWebAdapterAuthConfig()).toThrow(/not loopback/);
+
+    setEnv('WEBCHAT_BIND_ADDRESS', '127.0.0.1');
+    expect(loadWebAdapterAuthConfig()?.mode).toBe('local');
+
+    // Public mode is the supported way to expose it.
+    setEnv('WEBCHAT_AUTH_MODE', 'public');
+    setEnv('WEBCHAT_PUBLIC_BASE_URL', 'https://bawdeclaw.bawapps.com');
+    setEnv('WEBCHAT_BIND_ADDRESS', '0.0.0.0');
+    expect(loadWebAdapterAuthConfig()?.mode).toBe('public');
+  });
+
+  it('parses WEBCHAT_BASIC_USERS hashes and keeps the legacy password optional', () => {
+    publicEnv();
+    setEnv('WEBCHAT_BASIC_PASSWORD', undefined);
+    setEnv('WEBCHAT_BASIC_ALLOWED_USERNAMES', undefined);
+    setEnv('WEBCHAT_BASIC_USERS', 'Alice:scrypt$c2FsdA$aGFzaA,bob:sha256$' + 'a'.repeat(64));
+    const cfg = loadWebAdapterAuthConfig();
+    expect(cfg?.public?.basic.users?.get('alice')).toBe('scrypt$c2FsdA$aGFzaA');
+    expect(cfg?.public?.basic.users?.get('bob')).toBe('sha256$' + 'a'.repeat(64));
+    expect(cfg?.public?.basic.password).toBe('');
+
+    setEnv('WEBCHAT_BASIC_USERS', 'alice:plaintext-password');
+    expect(() => loadWebAdapterAuthConfig()).toThrow(/not a supported hash/);
+
+    setEnv('WEBCHAT_BASIC_USERS', undefined);
+    expect(() => loadWebAdapterAuthConfig()).toThrow(/WEBCHAT_BASIC_USERS or WEBCHAT_BASIC_PASSWORD/);
+
+    // Legacy: shared password requires the allowlist.
+    setEnv('WEBCHAT_BASIC_PASSWORD', 'legacy');
+    expect(() => loadWebAdapterAuthConfig()).toThrow(/WEBCHAT_BASIC_ALLOWED_USERNAMES/);
+    setEnv('WEBCHAT_BASIC_ALLOWED_USERNAMES', 'alice');
+    expect(loadWebAdapterAuthConfig()?.public?.basic.password).toBe('legacy');
   });
 
   it('warns when public OIDC is enabled with an empty allowlist', () => {
@@ -122,8 +182,6 @@ describe('loadWebAdapterAuthConfig', () => {
     vi.mocked(log.warn).mockClear();
     const cfg = loadWebAdapterAuthConfig();
     expect(cfg?.public?.oidcEnabled).toBe(true);
-    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(
-      expect.stringContaining('OIDC allowlist is empty'),
-    );
+    expect(vi.mocked(log.warn)).toHaveBeenCalledWith(expect.stringContaining('OIDC allowlist is empty'));
   });
 });

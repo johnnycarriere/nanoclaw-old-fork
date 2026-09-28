@@ -53,9 +53,13 @@ export interface PairingRecord {
   consumed?: ConsumedDetails;
   /** Recent pairing attempts observed while this record was pending. Capped. */
   attempts?: PairingAttempt[];
+  /** Set when the record was invalidated by the TTL rather than a wrong guess. */
+  expired?: boolean;
 }
 
 const MAX_ATTEMPTS_PER_RECORD = 10;
+/** A pending code is only good for this long after creation. */
+export const PAIRING_TTL_MS = 10 * 60 * 1000;
 /** Registry key of the default bot; also what a record with no `instance` means. */
 const DEFAULT_INSTANCE = 'telegram';
 const onInstance = (r: PairingRecord, instance: string) => (r.instance ?? DEFAULT_INSTANCE) === instance;
@@ -69,7 +73,7 @@ interface Store {
   pairings: PairingRecord[];
 }
 
-/** Pairing codes do not expire — they are consumed on match or invalidated by wrong guesses. */
+/** Pairing codes are consumed on match, invalidated by wrong guesses, or expire after PAIRING_TTL_MS. */
 const FILE_NAME = 'telegram-pairings.json';
 
 let storePathOverride: string | null = null;
@@ -114,11 +118,29 @@ function sweep(store: Store): boolean {
   return true;
 }
 
+function isExpired(r: PairingRecord, now = Date.now()): boolean {
+  const created = Date.parse(r.createdAt);
+  return Number.isFinite(created) && now - created > PAIRING_TTL_MS;
+}
+
+/** Flip pending records past the TTL to invalidated (flagged `expired`). Returns true when any changed. */
+function expireStale(store: Store, now = Date.now()): boolean {
+  let changed = false;
+  for (const r of store.pairings) {
+    if (r.status !== 'pending' || !isExpired(r, now)) continue;
+    r.status = 'invalidated';
+    r.expired = true;
+    changed = true;
+    log.info('Pairing expired', { intent: r.intent, instance: r.instance ?? DEFAULT_INSTANCE });
+  }
+  return changed;
+}
+
 function generateCode(active: Set<string>): string {
   // 6-digit numeric, zero-padded, from a CSPRNG. The code is the sole
   // authenticator binding a Telegram account to an agent group (and can
-  // promote to owner on a fresh install), and codes do not expire — so the
-  // stream must not be predictable from previously issued codes.
+  // promote to owner on a fresh install), and the 10-minute TTL is generous —
+  // so the stream must not be predictable from previously issued codes.
   // Math.random() (xorshift128+) is state-recoverable from observed outputs.
   // randomInt is rejection-sampled, so the draw is uniform.
   for (let i = 0; i < 50; i++) {
@@ -135,13 +157,14 @@ export async function createPairing(
   return withLock(() => {
     const store = readStore();
     sweep(store);
+    expireStale(store);
     // Replace-by-default: a new pairing for an intent supersedes any existing
     // pending pairing for the same intent on the same instance. Old
     // waitForPairing calls observe `invalidated` and exit on their own.
     for (const r of store.pairings) {
       if (r.status === 'pending' && intentEquals(r.intent, intent) && onInstance(r, instance)) {
         r.status = 'invalidated';
-        log.info('Pairing superseded by new request', { code: r.code, intent, instance });
+        log.debug('Pairing superseded by new request', { code: r.code, intent, instance });
       }
     }
     const active = new Set(store.pairings.filter((r) => r.status === 'pending').map((r) => r.code));
@@ -154,7 +177,7 @@ export async function createPairing(
     };
     store.pairings.push(record);
     writeStore(store);
-    log.info('Pairing created', { code: record.code, intent, instance });
+    log.debug('Pairing created', { code: record.code, intent, instance });
     return record;
   });
 }
@@ -206,6 +229,7 @@ export async function tryConsume(input: ConsumeInput): Promise<PairingRecord | n
     const store = readStore();
     const now = Date.now();
     sweep(store);
+    expireStale(store, now);
     const record = store.pairings.find((r) => r.code === code && r.status === 'pending' && onInstance(r, instance));
     if (!record) {
       // Miss: record the attempt on every record pending on THIS instance so
@@ -247,7 +271,7 @@ export async function tryConsume(input: ConsumeInput): Promise<PairingRecord | n
       { candidate: code, platformId: input.platformId, at: new Date(now).toISOString(), matched: true },
     ].slice(-MAX_ATTEMPTS_PER_RECORD);
     writeStore(store);
-    log.info('Pairing consumed', { code, platformId: input.platformId, intent: record.intent, instance });
+    log.debug('Pairing consumed', { code, platformId: input.platformId, intent: record.intent, instance });
     return record;
   });
 }
@@ -275,7 +299,7 @@ export interface WaitForPairingOptions {
 
 /**
  * Resolve when the pairing is consumed; reject when it is invalidated
- * (wrong code guess). Waits indefinitely — codes do not expire.
+ * (wrong code guess) or when it passes PAIRING_TTL_MS without being consumed.
  * Uses fs.watch as the primary signal with a slow poll fallback.
  */
 export async function waitForPairing(code: string, opts: WaitForPairingOptions = {}): Promise<PairingRecord> {
@@ -326,6 +350,11 @@ export async function waitForPairing(code: string, opts: WaitForPairingOptions =
       if (r.status === 'consumed') {
         cleanup();
         resolve(r);
+        return;
+      }
+      if ((r.status === 'invalidated' && r.expired) || (r.status === 'pending' && isExpired(r))) {
+        cleanup();
+        reject(new Error(`Pairing ${code} expired`));
         return;
       }
       if (r.status === 'invalidated') {

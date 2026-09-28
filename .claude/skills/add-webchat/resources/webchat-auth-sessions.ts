@@ -10,6 +10,9 @@ import Database from 'better-sqlite3';
 import { webchatDbPath } from './webchat-store.js';
 
 export const WEBCHAT_SESSION_COOKIE = 'webchat_session';
+/** Short-lived browser-binding nonce for the OIDC state (hash stored with the state row). */
+export const WEBCHAT_OAUTH_NONCE_COOKIE = 'webchat_oauth_nonce';
+export const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
 export interface WebchatSessionRecord {
   id: string;
@@ -66,6 +69,22 @@ CREATE TABLE IF NOT EXISTS web_mcp_oauth_clients (
   scope                  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS web_mcp_oauth_consents (
+  id                TEXT PRIMARY KEY,
+  client_id         TEXT NOT NULL,
+  client_name       TEXT,
+  session_id        TEXT NOT NULL,
+  user_id           TEXT NOT NULL,
+  display_name      TEXT NOT NULL,
+  code_challenge    TEXT NOT NULL,
+  redirect_uri      TEXT NOT NULL,
+  scopes_json       TEXT NOT NULL,
+  resource          TEXT,
+  state             TEXT,
+  csrf_nonce        TEXT NOT NULL,
+  created_at_ms     INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS web_mcp_oauth_codes (
   code              TEXT PRIMARY KEY,
   client_id         TEXT NOT NULL,
@@ -92,6 +111,11 @@ function getAuthDb(): Database.Database {
   db.pragma('wal_autocheckpoint = 1000');
   db.pragma('busy_timeout = 5000');
   db.exec(AUTH_SCHEMA);
+  try {
+    db.exec('ALTER TABLE web_oauth_states ADD COLUMN nonce_hash TEXT');
+  } catch {
+    // column already exists
+  }
   authDb = db;
   return db;
 }
@@ -186,37 +210,67 @@ function purgeExpiredSessions(db: Database.Database): void {
   db.prepare('DELETE FROM web_sessions WHERE expires_at_ms <= ?').run(Date.now());
 }
 
-export function saveOAuthState(state: string, providerId: string, codeVerifier: string): void {
+export function hashOAuthNonce(nonce: string): string {
+  return crypto.createHash('sha256').update(nonce, 'utf8').digest('hex');
+}
+
+/**
+ * Persist an OAuth state. `nonceHash` binds the state to the browser that started
+ * the login (sha256 of the WEBCHAT_OAUTH_NONCE_COOKIE value); the callback must
+ * present the matching cookie.
+ */
+export function saveOAuthState(state: string, providerId: string, codeVerifier: string, nonceHash?: string): void {
   const db = getAuthDb();
   purgeOAuthStates(db);
   db.prepare(
-    `INSERT INTO web_oauth_states (state, provider_id, code_verifier, created_at_ms) VALUES (?, ?, ?, ?)`,
-  ).run(state, providerId, codeVerifier, Date.now());
+    `INSERT INTO web_oauth_states (state, provider_id, code_verifier, nonce_hash, created_at_ms) VALUES (?, ?, ?, ?, ?)`,
+  ).run(state, providerId, codeVerifier, nonceHash ?? null, Date.now());
 }
 
 export interface OAuthStateRecord {
   providerId: string;
   codeVerifier: string;
+  nonceHash: string | null;
 }
 
 export function consumeOAuthState(state: string): OAuthStateRecord | null {
   const db = getAuthDb();
   purgeOAuthStates(db);
   const row = db
-    .prepare(`SELECT provider_id, code_verifier, created_at_ms FROM web_oauth_states WHERE state = ?`)
-    .get(state) as { provider_id: string; code_verifier: string; created_at_ms: number } | undefined;
+    .prepare(`SELECT provider_id, code_verifier, nonce_hash, created_at_ms FROM web_oauth_states WHERE state = ?`)
+    .get(state) as
+    | { provider_id: string; code_verifier: string; nonce_hash: string | null; created_at_ms: number }
+    | undefined;
   if (!row) return null;
-  if (Date.now() - row.created_at_ms > 10 * 60 * 1000) {
+  if (Date.now() - row.created_at_ms > OAUTH_STATE_TTL_MS) {
     db.prepare('DELETE FROM web_oauth_states WHERE state = ?').run(state);
     return null;
   }
   db.prepare('DELETE FROM web_oauth_states WHERE state = ?').run(state);
-  return { providerId: row.provider_id, codeVerifier: row.code_verifier };
+  return { providerId: row.provider_id, codeVerifier: row.code_verifier, nonceHash: row.nonce_hash };
 }
 
 function purgeOAuthStates(db: Database.Database): void {
-  const cutoff = Date.now() - 10 * 60 * 1000;
+  const cutoff = Date.now() - OAUTH_STATE_TTL_MS;
   db.prepare('DELETE FROM web_oauth_states WHERE created_at_ms < ?').run(cutoff);
+}
+
+export function oauthNonceCookieHeader(value: string, secure: boolean): string {
+  const parts = [
+    `${WEBCHAT_OAUTH_NONCE_COOKIE}=${encodeURIComponent(value)}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    `Max-Age=${Math.floor(OAUTH_STATE_TTL_MS / 1000)}`,
+  ];
+  if (secure) parts.push('Secure');
+  return parts.join('; ');
+}
+
+export function clearOAuthNonceCookieHeader(secure: boolean): string {
+  const parts = [`${WEBCHAT_OAUTH_NONCE_COOKIE}=`, 'HttpOnly', 'SameSite=Lax', 'Path=/', 'Max-Age=0'];
+  if (secure) parts.push('Secure');
+  return parts.join('; ');
 }
 
 export function signSessionCookie(sessionId: string, secret: string): string {
@@ -249,10 +303,7 @@ export function parseCookieHeader(header: string | undefined, name: string): str
   return undefined;
 }
 
-export function sessionCookieHeader(
-  value: string,
-  opts: { secure: boolean; maxAgeSeconds: number },
-): string {
+export function sessionCookieHeader(value: string, opts: { secure: boolean; maxAgeSeconds: number }): string {
   const parts = [
     `${WEBCHAT_SESSION_COOKIE}=${encodeURIComponent(value)}`,
     'HttpOnly',

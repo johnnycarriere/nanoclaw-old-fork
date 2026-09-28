@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
 import http from 'http';
-import os from 'os';
 import path from 'path';
 import { PassThrough, Readable, Writable } from 'stream';
 
@@ -46,14 +45,18 @@ vi.mock('busboy', async (importOriginal) => {
 
 import {
   acceptChunk,
+  chunkStagingRoot,
   consumeStagedUpload,
   formatMaxUploadLabel,
   getStagedUpload,
   isAcceptChunkOk,
   isValidUploadId,
   parseMultipartUpload,
+  MAX_PENDING_CHUNK_UPLOADS_PER_USER,
+  MAX_TOTAL_CHUNKS,
   resetUploadStateForTests,
   restoreStagedUpload,
+  sweepUploadStaging,
   uploadsStagingRoot,
 } from './webchat-uploads.js';
 
@@ -69,6 +72,87 @@ describe('webchat-uploads', () => {
     }
   });
 
+  it('bounds totalChunks by the upload size limit', async () => {
+    expect(MAX_TOTAL_CHUNKS).toBe(Math.ceil((50 * 1024 * 1024) / (512 * 1024)));
+    const result = await acceptChunk(
+      {
+        uploadId: '550e8400-e29b-41d4-a716-446655440077',
+        chunkIndex: 0,
+        totalChunks: MAX_TOTAL_CHUNKS + 1,
+        filename: 'big.bin',
+        data: 'YQ==',
+      },
+      'lobby',
+      'main',
+    );
+    expect(result).toMatchObject({ ok: false, status: 413 });
+    expect(fs.existsSync(path.join(chunkStagingRoot(), '550e8400-e29b-41d4-a716-446655440077'))).toBe(false);
+  });
+
+  it('caps pending chunked uploads per user and rejects cross-user continuation', async () => {
+    const ids = Array.from(
+      { length: MAX_PENDING_CHUNK_UPLOADS_PER_USER + 1 },
+      (_, i) => `550e8400-e29b-41d4-a716-4466554401${String(i).padStart(2, '0')}`,
+    );
+    for (let i = 0; i < MAX_PENDING_CHUNK_UPLOADS_PER_USER; i++) {
+      const r = await acceptChunk(
+        { uploadId: ids[i]!, chunkIndex: 0, totalChunks: 2, filename: 'a.txt', data: 'YQ==' },
+        'lobby',
+        'main',
+        'web:basic:alice',
+      );
+      expect(r.ok).toBe(true);
+    }
+    const overflow = await acceptChunk(
+      {
+        uploadId: ids[MAX_PENDING_CHUNK_UPLOADS_PER_USER]!,
+        chunkIndex: 0,
+        totalChunks: 2,
+        filename: 'a.txt',
+        data: 'YQ==',
+      },
+      'lobby',
+      'main',
+      'web:basic:alice',
+    );
+    expect(overflow).toMatchObject({ ok: false, status: 429 });
+    // Another user is not affected by alice's cap...
+    const bob = await acceptChunk(
+      {
+        uploadId: ids[MAX_PENDING_CHUNK_UPLOADS_PER_USER]!,
+        chunkIndex: 0,
+        totalChunks: 2,
+        filename: 'a.txt',
+        data: 'YQ==',
+      },
+      'lobby',
+      'main',
+      'web:basic:bob',
+    );
+    expect(bob.ok).toBe(true);
+    // ...but cannot append to alice's in-progress upload.
+    const hijack = await acceptChunk(
+      { uploadId: ids[0]!, chunkIndex: 1, totalChunks: 2, filename: 'a.txt', data: 'Yg==' },
+      'lobby',
+      'main',
+      'web:basic:bob',
+    );
+    expect(hijack).toMatchObject({ ok: false, status: 403 });
+  });
+
+  it('stages chunks under DATA_DIR and sweeps the staging root on boot', async () => {
+    const uploadId = '550e8400-e29b-41d4-a716-446655440088';
+    await acceptChunk({ uploadId, chunkIndex: 0, totalChunks: 2, filename: 'a.txt', data: 'YQ==' }, 'lobby', 'main');
+    const chunkDir = path.join(chunkStagingRoot(), uploadId);
+    expect(chunkDir.startsWith(path.join(TEST_DATA, 'webchat-uploads'))).toBe(true);
+    expect(fs.existsSync(chunkDir)).toBe(true);
+    fs.mkdirSync(path.join(uploadsStagingRoot(), 'stale-upload'), { recursive: true });
+    sweepUploadStaging();
+    expect(fs.existsSync(chunkDir)).toBe(false);
+    expect(fs.existsSync(path.join(uploadsStagingRoot(), 'stale-upload'))).toBe(false);
+    sweepUploadStaging(); // missing root is a no-op
+  });
+
   it('validates upload ids as UUIDs', () => {
     expect(isValidUploadId('550e8400-e29b-41d4-a716-446655440000')).toBe(true);
     expect(isValidUploadId('../etc/passwd')).toBe(false);
@@ -77,7 +161,9 @@ describe('webchat-uploads', () => {
   it('parses multipart uploads to staging', async () => {
     const boundary = '----TestBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+      ),
       Buffer.from('hello'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -115,7 +201,9 @@ describe('webchat-uploads', () => {
   it('infers mp3 mime types from filename on multipart upload', async () => {
     const boundary = '----TestBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="song.mp3"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="song.mp3"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      ),
       Buffer.from('fake-mp3'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -154,11 +242,13 @@ describe('webchat-uploads', () => {
   });
 
   it('rejects invalid chunk requests', async () => {
-    expect(await acceptChunk(
-      { uploadId: 'not-a-uuid', chunkIndex: 0, totalChunks: 1, filename: 'a.txt', data: 'YQ==' },
-      'lobby',
-      'main',
-    )).toMatchObject({ error: 'Invalid uploadId format', status: 400 });
+    expect(
+      await acceptChunk(
+        { uploadId: 'not-a-uuid', chunkIndex: 0, totalChunks: 1, filename: 'a.txt', data: 'YQ==' },
+        'lobby',
+        'main',
+      ),
+    ).toMatchObject({ error: 'Invalid uploadId format', status: 400 });
 
     const uploadId = '550e8400-e29b-41d4-a716-446655440000';
     await acceptChunk(
@@ -166,11 +256,13 @@ describe('webchat-uploads', () => {
       'lobby',
       'main',
     );
-    expect(await acceptChunk(
-      { uploadId, chunkIndex: 1, totalChunks: 3, filename: 'a.txt', mimeType: 'text/plain', data: 'Yg==' },
-      'lobby',
-      'main',
-    )).toMatchObject({ error: 'totalChunks mismatch', status: 400 });
+    expect(
+      await acceptChunk(
+        { uploadId, chunkIndex: 1, totalChunks: 3, filename: 'a.txt', mimeType: 'text/plain', data: 'Yg==' },
+        'lobby',
+        'main',
+      ),
+    ).toMatchObject({ error: 'totalChunks mismatch', status: 400 });
   });
 
   it('returns partial progress for multi-chunk uploads', async () => {
@@ -240,11 +332,13 @@ describe('webchat-uploads', () => {
   });
 
   it('rejects chunk uploads with missing fields', async () => {
-    expect(await acceptChunk(
-      { uploadId: '550e8400-e29b-41d4-a716-446655440000', chunkIndex: 0, totalChunks: 1, filename: '', data: '' },
-      'lobby',
-      'main',
-    )).toMatchObject({ status: 400 });
+    expect(
+      await acceptChunk(
+        { uploadId: '550e8400-e29b-41d4-a716-446655440000', chunkIndex: 0, totalChunks: 1, filename: '', data: '' },
+        'lobby',
+        'main',
+      ),
+    ).toMatchObject({ status: 400 });
   });
 
   it('rejects non-multipart uploads', async () => {
@@ -293,7 +387,9 @@ describe('webchat-uploads', () => {
     const mod = await import('./webchat-uploads.js');
     const boundary = '----LimitBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="big.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="big.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      ),
       Buffer.from('123456789'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -390,7 +486,9 @@ describe('webchat-uploads', () => {
   it('returns 500 when multipart write fails without hitting size limit', async () => {
     const boundary = '----WriteFailBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="fail.txt"\r\nContent-Type: text/plain\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="fail.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+      ),
       Buffer.from('hello'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -453,7 +551,7 @@ describe('webchat-uploads', () => {
       if (
         args.length >= 2 &&
         typeof args[0] === 'string' &&
-        args[0].includes('nanoclaw-webchat-chunk') &&
+        args[0].includes(`${path.sep}staging${path.sep}`) &&
         args[1] === '0'
       ) {
         return '/tmp/nanoclaw-webchat-escape-chunk';
@@ -517,7 +615,9 @@ describe('webchat-uploads', () => {
   it('rejects multipart uploads when the staged file is not a regular file', async () => {
     const boundary = '----RegularFileBoundary';
     const payload = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+      ),
       Buffer.from('hello'),
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -621,7 +721,7 @@ describe('webchat-uploads', () => {
       'lobby',
       'main',
     );
-    const tempDir = path.join(os.tmpdir(), `nanoclaw-webchat-chunk-${uploadId}`);
+    const tempDir = path.join(chunkStagingRoot(), uploadId);
     expect(fs.existsSync(tempDir)).toBe(true);
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 1);
     expect(fs.existsSync(tempDir)).toBe(false);
@@ -741,8 +841,17 @@ describe('webchat-uploads', () => {
     vi.useRealTimers();
   });
 
-  it('formats GB upload limits by default', () => {
-    expect(formatMaxUploadLabel()).toBe('1.0 GB');
+  it('formats the 50 MB default upload limit', () => {
+    expect(formatMaxUploadLabel()).toBe('50 MB');
+  });
+
+  it('formats GB upload limits from env', async () => {
+    vi.stubEnv('WEBCHAT_MAX_UPLOAD_BYTES', String(1024 * 1024 * 1024));
+    vi.resetModules();
+    const mod = await import('./webchat-uploads.js');
+    expect(mod.formatMaxUploadLabel()).toBe('1.0 GB');
+    vi.unstubAllEnvs();
+    vi.resetModules();
   });
 
   it('formats MB upload limits from env', async () => {

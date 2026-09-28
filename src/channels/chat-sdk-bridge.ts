@@ -4,6 +4,7 @@
  *
  * Used by Discord, Slack, and other Chat SDK-supported platforms.
  */
+import { createHash, randomBytes } from 'node:crypto';
 import http from 'http';
 
 import {
@@ -395,6 +396,80 @@ function resolveSelectedOption(
   return candidate;
 }
 
+/**
+ * send_card callback registry. Telegram caps callback_data at 64 bytes and
+ * the adapter throws ValidationError for the WHOLE card when one button's
+ * value pushes the JSON payload past it, so — exactly like ask_question —
+ * buttons carry an index and the real value lives here until clicked.
+ * In-memory: cards a restart ago render as plain text on click (the value
+ * falls back to the label) instead of failing.
+ */
+const SEND_CARD_TTL_MS = 24 * 60 * 60 * 1000;
+const SEND_CARD_MAX = 500;
+const sendCardRenders = new Map<string, { at: number; options: NormalizedOption[] }>();
+
+export function registerSendCardRender(options: NormalizedOption[], now = Date.now()): string {
+  for (const [id, entry] of sendCardRenders) {
+    if (now - entry.at > SEND_CARD_TTL_MS) sendCardRenders.delete(id);
+  }
+  while (sendCardRenders.size >= SEND_CARD_MAX) {
+    const oldest = sendCardRenders.keys().next().value;
+    if (oldest === undefined) break;
+    sendCardRenders.delete(oldest);
+  }
+  const id = randomBytes(4).toString('hex');
+  sendCardRenders.set(id, { at: now, options });
+  return id;
+}
+
+export function resolveSendCardRender(cardId: string): { options: NormalizedOption[] } | undefined {
+  return sendCardRenders.get(cardId);
+}
+
+/** Recently re-injected send_card clicks, so a double-tap never reaches the router twice. */
+const SEND_CARD_CLICK_TTL_MS = 60 * 1000;
+const recentSendCardClicks = new Map<string, number>();
+
+/**
+ * Stable inbound id for a send_card click: the card message plus the chosen
+ * value. Two taps on the same button produce the same id (and the session
+ * DB's primary key rejects the second one even if the in-memory gate misses).
+ */
+export function sendCardClickId(messageId: string, value: string): string {
+  return `${messageId}:${createHash('sha1').update(value).digest('hex').slice(0, 12)}`;
+}
+
+function isDuplicateSendCardClick(id: string, now = Date.now()): boolean {
+  for (const [key, at] of recentSendCardClicks) {
+    if (now - at > SEND_CARD_CLICK_TTL_MS) recentSendCardClicks.delete(key);
+  }
+  if (recentSendCardClicks.has(id)) return true;
+  recentSendCardClicks.set(id, now);
+  return false;
+}
+
+/**
+ * Whether a button click came from a group chat. Telegram's callback_query
+ * carries the originating message (with chat.type); other platforms leave
+ * it undefined, which the router already treats as "not a group".
+ */
+export function actionIsGroup(raw: unknown, adapterName: string, threadId: string): boolean | undefined {
+  const chatType = (raw as { message?: { chat?: { type?: unknown } } } | undefined)?.message?.chat?.type;
+  if (typeof chatType === 'string') return chatType !== 'private';
+  if (adapterName === 'telegram') return (threadId.split(':').pop() ?? '').startsWith('-');
+  return undefined;
+}
+
+/**
+ * Telegram rejects a message whose MarkdownV2 entities don't balance with a
+ * 400 "can't parse entities" — surfaced by the adapter as a ValidationError.
+ * The bridge retries that chunk as raw text rather than losing the reply.
+ */
+export function isParseEntitiesError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return err.name === 'ValidationError' && /parse entities/i.test(err.message);
+}
+
 interface TerminalApprovalCard {
   title: string;
   question: string;
@@ -692,15 +767,28 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // Handle button clicks (ask_user_question)
       chat.onAction(async (event) => {
-        // ncs: (send_card action) — re-inject value as inbound message
-        if (event.actionId === 'ncs') {
-          const value = event.value ?? '';
+        // ncs: (send_card action) — re-inject value as inbound message.
+        // New format `ncs:<cardId>` carries an option index (see
+        // registerSendCardRender); legacy bare `ncs` carries the value itself.
+        if (event.actionId === 'ncs' || event.actionId.startsWith('ncs:')) {
+          const cardId = event.actionId.startsWith('ncs:') ? event.actionId.slice(4) : null;
+          const render = cardId ? resolveSendCardRender(cardId) : undefined;
+          const value = resolveSelectedOption(render, event.value, event.value);
           const channelId = adapter.channelIdFromThreadId(event.threadId);
+          const id = sendCardClickId(event.messageId, value);
+          if (isDuplicateSendCardClick(id)) {
+            log.debug('send_card click ignored (duplicate)', { id });
+            return;
+          }
           await setupConfig.onInbound(channelId, event.threadId, {
             kind: 'chat-sdk',
-            id: '',
+            id,
             timestamp: new Date().toISOString(),
             content: { text: value, author: event.user ? { userId: event.user.userId } : undefined },
+            // A button click is the user addressing the bot — the router only
+            // acts on mentions in groups and when auto-creating a wiring.
+            isMention: true,
+            isGroup: actionIsGroup(event.raw, adapter.name, event.threadId),
           });
           return;
         }
@@ -916,19 +1004,31 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           }
         }
         if (Array.isArray(cardSpec.actions)) {
-          const allButtons = (cardSpec.actions as Array<Record<string, unknown>>)
-            .filter((a) => typeof a.label === 'string' && a.label)
+          const labelled = (cardSpec.actions as Array<Record<string, unknown>>).filter(
+            (a) => typeof a.label === 'string' && a.label,
+          );
+          // Callback buttons carry an index into a per-card registry entry
+          // (Telegram's 64-byte callback_data cap); the click handler
+          // resolves it back to the value. Registered only when the card has
+          // at least one callback button.
+          const callbackOptions: NormalizedOption[] = labelled
+            .filter((a) => !(typeof a.url === 'string' && a.url))
             .map((a) => {
-              const style = a.style;
-              const safeStyle: 'primary' | 'danger' | 'default' | undefined =
-                style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
-              if (typeof a.url === 'string' && a.url) {
-                return LinkButton({ label: a.label as string, url: a.url, style: safeStyle });
-              }
-              // Non-URL action: re-inject value as inbound message on click (ncs: prefix)
               const value = typeof a.value === 'string' ? a.value : (a.label as string);
-              return Button({ id: 'ncs', label: a.label as string, value });
+              return { label: a.label as string, selectedLabel: a.label as string, value };
             });
+          const cardId = callbackOptions.length > 0 ? registerSendCardRender(callbackOptions) : null;
+          let callbackIdx = 0;
+          const allButtons = labelled.map((a) => {
+            const style = a.style;
+            const safeStyle: 'primary' | 'danger' | 'default' | undefined =
+              style === 'primary' || style === 'danger' || style === 'default' ? style : undefined;
+            if (typeof a.url === 'string' && a.url) {
+              return LinkButton({ label: a.label as string, url: a.url, style: safeStyle });
+            }
+            // Non-URL action: re-inject value as inbound message on click (ncs: prefix)
+            return Button({ id: `ncs:${cardId}`, label: a.label as string, value: String(callbackIdx++) });
+          });
           if (allButtons.length > 0) {
             cardChildren.push(Actions(allButtons));
           }
@@ -963,10 +1063,22 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
-            tid,
-            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
-          );
+          let result;
+          try {
+            result = await adapter.postMessage(
+              tid,
+              attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+            );
+          } catch (err) {
+            if (!isParseEntitiesError(err)) throw err;
+            // Retry this chunk once with formatting disabled (`raw` posts
+            // without a parse_mode), so only the failed chunk is resent.
+            log.warn('Outbound markdown rejected by platform, retrying chunk as plain text', {
+              adapter: adapter.name,
+              err,
+            });
+            result = await adapter.postMessage(tid, attachFiles ? { raw: chunk, files: fileUploads } : { raw: chunk });
+          }
           if (i === 0) firstId = result?.id;
         }
         return firstId;
@@ -988,6 +1100,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     async teardown() {
       gatewayAbort?.abort();
+      // Polling adapters (Telegram) have no `disconnect`, so chat.shutdown()
+      // leaves the getUpdates loop running; stop it first.
+      const polling = adapter as Adapter & { stopPolling?: () => Promise<void> };
+      if (typeof polling.stopPolling === 'function') {
+        try {
+          await polling.stopPolling();
+        } catch (err) {
+          log.warn('stopPolling failed during teardown', { adapter: adapter.name, err });
+        }
+      }
       await chat.shutdown();
       log.info('Chat SDK bridge shut down', { adapter: adapter.name });
     },

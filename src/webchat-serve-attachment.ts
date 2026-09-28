@@ -36,6 +36,34 @@ export function mimeTypeFromFilename(filename: string): string {
   return EXT_TO_MIME[ext] ?? 'application/octet-stream';
 }
 
+/** Extensions a browser would execute as active content if served with their natural type. */
+const ACTIVE_CONTENT_EXTS = new Set(['.html', '.htm', '.svg', '.xml', '.js', '.mjs']);
+
+/**
+ * Content-Type for serving a stored attachment: active content (HTML/SVG/XML/JS)
+ * is always downgraded to text/plain so a stored file can never run in the
+ * webchat origin.
+ */
+export function attachmentResponseContentType(storageName: string): string {
+  const ext = storageName.includes('.') ? `.${storageName.split('.').pop()!.toLowerCase()}` : '';
+  if (ACTIVE_CONTENT_EXTS.has(ext)) return 'text/plain; charset=utf-8';
+  return mimeTypeFromFilename(storageName);
+}
+
+/** Download filename shown to the browser: storage name without the `<index>-` prefix. */
+export function attachmentDownloadName(storageName: string): string {
+  const stripped = storageName.replace(/^\d+-/, '');
+  return stripped || storageName || 'attachment';
+}
+
+/** `attachment; filename="..."; filename*=UTF-8''...` — every attachment downloads, never renders top-level. */
+export function attachmentContentDisposition(storageName: string): string {
+  const name = attachmentDownloadName(storageName);
+  // ASCII fallback: drop quotes/backslashes/control chars and non-ASCII.
+  const ascii = name.replace(/["\\\r\n]/g, '_').replace(/[^\x20-\x7e]/g, '_');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
 /** Prefer filename inference when upload/browser MIME is missing or generic. */
 export function inferAttachmentMime(name: string, mimeType = ''): string {
   const trimmed = mimeType.trim().split(';', 1)[0].trim().toLowerCase();
@@ -114,11 +142,14 @@ export function serveAttachmentFile(
     return;
   }
 
-  const contentType = mimeTypeFromFilename(storageName);
+  const contentType = attachmentResponseContentType(storageName);
   const baseHeaders = {
     'Content-Type': contentType,
+    'Content-Disposition': attachmentContentDisposition(storageName),
     'Accept-Ranges': 'bytes',
     'X-Content-Type-Options': 'nosniff',
+    // Even if something renders the bytes, it runs in an opaque origin with no script.
+    'Content-Security-Policy': 'sandbox',
   } as const;
 
   const rangeHeader = req.headers.range;

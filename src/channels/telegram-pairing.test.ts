@@ -15,6 +15,7 @@ import {
   extractAddressedText,
   _setStorePathForTest,
   _resetForTest,
+  PAIRING_TTL_MS,
 } from './telegram-pairing.js';
 
 let tmpDir: string;
@@ -167,7 +168,7 @@ describe('waitForPairing', () => {
     const r = await createPairing('main');
     const p = waitForPairing(r.code, { pollMs: 50 });
     setTimeout(() => {
-      tryConsume({ text: `@b ${r.code}`, botUsername: 'b', platformId: 'tg:1', isGroup: true, name: 'Group' });
+      void tryConsume({ text: `@b ${r.code}`, botUsername: 'b', platformId: 'tg:1', isGroup: true, name: 'Group' });
     }, 100);
     const consumed = await p;
     expect(consumed.status).toBe('consumed');
@@ -178,7 +179,7 @@ describe('waitForPairing', () => {
     const r = await createPairing('main');
     const waiter = waitForPairing(r.code, { pollMs: 30 });
     setTimeout(() => {
-      tryConsume({ text: '000000', botUsername: 'b', platformId: 'tg:1', isGroup: false });
+      void tryConsume({ text: '000000', botUsername: 'b', platformId: 'tg:1', isGroup: false });
     }, 60);
     await expect(waiter).rejects.toThrow(/invalidated/);
   });
@@ -217,7 +218,7 @@ describe('attempt tracking', () => {
       onAttempt: (a) => attempts.push(a.candidate),
     });
     setTimeout(() => {
-      tryConsume({ text: '999999', botUsername: 'b', platformId: 'tg:1', isGroup: false });
+      void tryConsume({ text: '999999', botUsername: 'b', platformId: 'tg:1', isGroup: false });
     }, 60);
     await expect(waiter).rejects.toThrow(/invalidated by wrong code \(999999\)/);
     expect(attempts).toEqual(['999999']);
@@ -232,7 +233,7 @@ describe('attempt tracking', () => {
       onAttempt: (a) => attempts.push(a.candidate),
     });
     setTimeout(() => {
-      tryConsume({ text: r.code, botUsername: 'b', platformId: 'tg:1', isGroup: false });
+      void tryConsume({ text: r.code, botUsername: 'b', platformId: 'tg:1', isGroup: false });
     }, 60);
     const consumed = await waiter;
     expect(consumed.status).toBe('consumed');
@@ -323,5 +324,27 @@ describe('instance isolation', () => {
     expect(getStatus('123456')).toBe('pending');
     const onDefault = await tryConsume({ text: '123456', botUsername: 'b', platformId: 'p', isGroup: false });
     expect(onDefault?.status).toBe('consumed');
+  });
+});
+
+describe('pairing TTL', () => {
+  it('a pending code older than PAIRING_TTL_MS no longer consumes and the waiter rejects as expired', async () => {
+    vi.useFakeTimers();
+    try {
+      const r = await createPairing('main');
+      vi.setSystemTime(Date.now() + PAIRING_TTL_MS + 1000);
+      const consumed = await tryConsume({ text: r.code, botUsername: 'b', platformId: 'tg:1', isGroup: false });
+      expect(consumed).toBeNull();
+      expect(getStatus(r.code)).toBe('invalidated');
+      await expect(waitForPairing(r.code, { pollMs: 30 })).rejects.toThrow(/expired/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a fresh code still consumes', async () => {
+    const r = await createPairing('main');
+    const consumed = await tryConsume({ text: r.code, botUsername: 'b', platformId: 'tg:1', isGroup: false });
+    expect(consumed?.status).toBe('consumed');
   });
 });

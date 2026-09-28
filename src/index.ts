@@ -54,7 +54,7 @@ async function backfillReactionStateOnStartup(): Promise<void> {
         outDb.close();
       }
     } catch (err) {
-      log.debug('reaction-state backfill skipped session', { sessionId: session.id, err });
+      log.warn('reaction-state backfill skipped session', { sessionId: session.id, err });
     }
   }
   log.info('Backfilled reaction state', { sessions: backfilled });
@@ -126,8 +126,15 @@ async function main(): Promise<void> {
   await adoptRunningSessions();
 
   // 3. Channel adapters
-  const { startWebChat } = await import('./webchat-boot.js');
-  await startWebChat();
+  // FORK: web chat boots before the channel adapters. A boot failure is
+  // logged and skipped so it cannot crash-loop the whole host under the
+  // service manager's Restart=always.
+  try {
+    const { startWebChat } = await import('./webchat-boot.js');
+    await startWebChat();
+  } catch (err) {
+    log.error('Web chat failed to start — continuing without it', { err });
+  }
 
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {

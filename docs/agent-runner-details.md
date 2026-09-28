@@ -59,6 +59,13 @@ interface QueryInput {
   /** Initial prompt, already formatted by the agent-runner into a string. */
   prompt: string;
 
+  /** Image attachments from the same batch, out-of-band. The prompt text holds
+   *  a numbered `[image N: name]` placeholder per entry, in array order.
+   *  Providers with native image input build their own content blocks from
+   *  these; text-only providers may ignore the field (the file stays on disk
+   *  under /workspace, but the numbered placeholder does not name its path). */
+  images?: ImageContent[];
+
   /** Opaque continuation token from a previous query. The provider decides
    *  what it means (session ID, thread ID, or nothing). */
   continuation?: string;
@@ -75,9 +82,19 @@ type McpServerConfig =
   | { type?: 'stdio'; command: string; args?: string[]; env?: Record<string, string> }
   | { type: 'http'; url: string };
 
+interface ImageContent {
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+  data: string;   // base64
+  bytes: number;  // raw size, for the per-prompt budget
+}
+
 interface AgentQuery {
   /** Push a follow-up message into the active query. */
   push(message: string): void;
+
+  /** Optional: push a follow-up whose batch carried images (QueryInput.images
+   *  contract). When absent, the poll-loop pushes the text alone via push(). */
+  pushImages?(message: string, images: ImageContent[]): void;
 
   /** Signal that no more input will be sent. */
   end(): void;
@@ -400,7 +417,7 @@ The agent-runner signals "busy" status to the host. The mechanism for this is pr
 
 ### Message Formatting
 
-The agent-runner transforms messages_in rows into a prompt string. The provider receives a ready-to-send string — it doesn't know about message kinds or routing.
+The agent-runner transforms messages_in rows into a prompt string. The provider receives a ready-to-send string — it doesn't know about message kinds or routing. Image attachments are the one exception: they travel beside the string as `QueryInput.images` (see Media Handling below), never inside it.
 
 **Routing field stripping:** `platform_id`, `channel_type`, `thread_id` are never included in the prompt. They're stored as context for writing messages_out.
 
@@ -417,9 +434,10 @@ themselves are never shown.
   A reply carries a `reply_to` attribute and an inline `<quoted_message from="…">…</quoted_message>`.
 
 - **`chat-sdk`** — same `<message>` shape, fields extracted from the serialized Chat SDK
-  message. Attachments are appended inline: `[image: screenshot.png — saved to /workspace/…]`
-  or `[image: screenshot.png (https://signed-url…)]`. Images/PDFs that Claude handles
-  natively are also passed as content blocks (see Media Handling below).
+  message. Attachments are appended inline: `[file: data.xlsx — saved to /workspace/…]`
+  or `[file: data.xlsx (https://signed-url…)]`. An image attachment that was inlined for the
+  provider renders as a numbered `[image N: screenshot.png]` placeholder instead (see Media
+  Handling below); one that was not (missing, unrecognized, over budget) keeps the path marker.
 
 - **`task`** — a `<task>` element, script output first when present:
   ```xml
@@ -697,27 +715,35 @@ The agent-runner inspects attachments in chat/chat-sdk messages and handles them
 
 | Type | Claude | Codex / OpenCode |
 |------|--------|------------------|
-| Images (JPEG, PNG, GIF, WebP) | Native image content block | Save to disk |
-| PDFs | Native document content block | Save to disk |
-| Audio | Native audio content block | Save to disk |
-| Other files (code, data, video, archives) | Save to disk | Save to disk |
+| Images (JPEG, PNG, GIF, WebP) | Native image content block | Path marker (agent Reads the file) |
+| Other files (PDF, code, data, audio, video, archives) | Path marker | Path marker |
 
-**"Save to disk"** means: download to `/workspace/downloads/{messageId}/`, reference in the prompt text:
+**Path marker** means: the channel adapter has already saved the file under `/workspace/` (`localPath`, relative to the workspace root) and the prompt text references it:
 
 ```
-<message sender="John" time="10:00">
-  Check this spreadsheet
-  [file available at: /workspace/downloads/msg-123/data.xlsx]
-</message>
+<message sender="John" time="10:00">Check this spreadsheet
+[file: data.xlsx — saved to /workspace/inbox/data.xlsx]</message>
 ```
 
 The agent can use tools (Read, Bash) to access saved files.
 
-For channels where direct download isn't possible (e.g., WhatsApp buffered streams), the channel adapter serves the media via a local URL. The agent-runner downloads from that URL.
+**Image inlining (`container/agent-runner/src/attachments.ts` + `formatter.ts`):** for `type: 'image'` attachments with a `localPath`, the formatter sniffs the magic bytes, base64-encodes the file and pushes an `ImageContent` onto a per-prompt sink; the text gets a numbered placeholder `[image N: name]` where N is the image's 1-based position on the sink. Numbering is explicit because providers append image blocks *after* the text — the model matches placeholder N to the Nth image. Budget, all in `attachments.ts`:
 
-**Content block construction (Claude):** The agent-runner builds multi-part `MessageParam` content: `[{ type: 'image', source: { type: 'base64', media_type, data } }, { type: 'text', text: '...' }]`. The prompt passed to the provider is not a plain string in this case — the `QueryInput.prompt` field needs to support structured content for Claude. The provider's `query()` method handles the format-specific construction.
+| Limit | Value | Past it |
+|-------|-------|---------|
+| `MAX_RAW_IMAGE_BYTES` | 3.5 MB raw per image (≈ 4.7 MB base64, under the API's 5 MB) | that image keeps its path marker |
+| `MAX_IMAGES_PER_PROMPT` | 20 per prompt | later images keep their path marker |
+| `MAX_IMAGE_BYTES_PER_PROMPT` | 15 MB raw per prompt | later images keep their path marker |
 
-**Content block construction (Codex/OpenCode):** Everything is text. File references are inlined in the prompt string. The provider receives a plain string prompt.
+The budget scope is one provider prompt: `formatMessagesWithCommands` (initial batch) shares a single sink across every sub-batch it flushes around passthrough commands, and each follow-up `push()` gets its own. A fallen-back image still reaches the agent as `[image: name — saved to /workspace/…]`, so it can Read the file. Path-traversal `localPath`s that escape the workspace root are rejected. There is no resize step (no `sharp` in the agent-runner image), so the raw cap is the only per-image bound.
+
+**Out-of-band carriage:** `QueryInput.prompt` and `AgentQuery.push(message)` stay plain strings for every provider. Images ride as `QueryInput.images` (set only when at least one image was inlined) and, for mid-turn follow-ups, through the optional `AgentQuery.pushImages(message, images)` — `pushFollowUp` in `poll-loop.ts` calls it when the provider implements it and the batch has images, else `push(text)`. Typed `ImageContent[]` end-to-end. `push` itself takes no second argument so providers that extend it privately (upstream OpenCode's `attachments`) typecheck unchanged.
+
+**Content block construction (Claude):** `toSdkContent(prompt, images)` in `providers/claude.ts` returns the string itself when there are no images — same wire shape as before — and otherwise `[{ type: 'text', text: prompt }, { type: 'image', source: { type: 'base64', media_type, data } }, …]` in `images` order. The SDK forwards the array to the Messages API verbatim.
+
+**Content block construction (Codex/OpenCode):** everything is text. They read `input.prompt` as a string and ignore `images`, so an inlined image's `[image N: name]` placeholder reaches them without the payload (the file is still on disk under `/workspace`; only budget-fallback images keep the path marker).
+
+**Transcript rotation interaction (Claude):** every inlined image lands verbatim in the SDK's on-disk `.jsonl`, which `maybeRotateContinuation` sizes on cold resume. Rather than resizing before inlining (no `sharp`), the provider counts image payload separately: when the raw file size is over `CLAUDE_TRANSCRIPT_ROTATE_BYTES` (default 12 MiB) it scans the transcript for long base64 `"data"` values (image blocks, including images the agent Read) and applies that cap to the *non-image* bytes only. A second, image-inclusive ceiling `CLAUDE_TRANSCRIPT_ROTATE_IMAGE_BYTES` (default 64 MiB) still bounds the total so the resume path stays loadable. The age trigger is unchanged.
 
 #### Outbound (agent → messages_out)
 
@@ -753,8 +779,9 @@ The agent-runner tracks a single opaque `continuation` token per provider:
 Because it lives in the session folder's `outbound.db`, the continuation survives container
 teardown and restart — a fresh container reads it back and resumes. `/clear` deletes the row
 to start a clean session. Before resuming, `maybeRotateContinuation` may archive and drop an
-oversized/aged transcript (so a cold container isn't killed reloading it), and
-`isSessionInvalid` clears a continuation whose backing transcript has gone missing.
+oversized/aged transcript (so a cold container isn't killed reloading it; inlined image bytes
+are capped separately — see Media Handling), and `isSessionInvalid` clears a continuation
+whose backing transcript has gone missing.
 
 ### Container Startup
 

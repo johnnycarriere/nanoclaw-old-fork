@@ -13,7 +13,6 @@ import { migration010 } from './010-engage-modes.js';
 import { migration011 } from './011-pending-sender-approvals.js';
 import { migration012 } from './012-channel-registration.js';
 import { migration013 } from './013-approval-render-metadata.js';
-import { migration014 as migrationHostReactionState } from './014-host-reaction-state.js';
 import { migration014 } from './014-container-configs.js';
 import { migration015 } from './015-cli-scope.js';
 import { migration016 } from './016-messaging-group-instance.js';
@@ -85,7 +84,6 @@ export const migrations: Migration[] = [
   migration013,
   migration014,
   migration015,
-  migrationHostReactionState,
   migration016,
   migration019,
   migration020,

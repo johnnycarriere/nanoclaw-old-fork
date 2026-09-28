@@ -181,6 +181,11 @@ export function ensureWebchatSchema(): void {
     } catch {
       // column already exists
     }
+    try {
+      db.exec('ALTER TABLE web_threads ADD COLUMN created_by TEXT');
+    } catch {
+      // column already exists
+    }
     db.exec(WEBCHAT_THREAD_SEQ_SCHEMA);
     backfillThreadSeqForExistingMessages(db);
   } finally {
@@ -255,13 +260,13 @@ export function listThreads(platformId: string): WebchatThreadMeta[] {
   }
 }
 
-export function upsertThread(platformId: string, threadId: string, title: string): void {
+export function upsertThread(platformId: string, threadId: string, title: string, createdBy?: string): void {
   const now = new Date().toISOString();
   const db = openDb();
   try {
     db.prepare(
-      `INSERT INTO web_threads (platform_id, thread_id, title, created_at, updated_at)
-       VALUES (@platform_id, @thread_id, @title, @created_at, @updated_at)
+      `INSERT INTO web_threads (platform_id, thread_id, title, created_at, updated_at, created_by)
+       VALUES (@platform_id, @thread_id, @title, @created_at, @updated_at, @created_by)
        ON CONFLICT(platform_id, thread_id) DO UPDATE SET
          title = excluded.title,
          updated_at = excluded.updated_at`,
@@ -271,16 +276,43 @@ export function upsertThread(platformId: string, threadId: string, title: string
       title,
       created_at: now,
       updated_at: now,
+      created_by: createdBy ?? null,
     });
   } finally {
     db.close();
   }
 }
 
-export function createThread(platformId: string, title: string): WebchatThreadMeta {
+export function createThread(platformId: string, title: string, createdBy?: string): WebchatThreadMeta {
   const threadId = newThreadId();
-  upsertThread(platformId, threadId, title);
+  upsertThread(platformId, threadId, title, createdBy);
   return { id: threadId, title };
+}
+
+/** User id that created the thread (null for legacy rows / unknown threads). */
+export function getThreadCreator(platformId: string, threadId: string): string | null {
+  const db = openDb();
+  try {
+    const row = db
+      .prepare(`SELECT created_by FROM web_threads WHERE platform_id = ? AND thread_id = ?`)
+      .get(platformId, threadId) as { created_by: string | null } | undefined;
+    return row?.created_by ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+/** Room + thread a message belongs to (for attachment authz), or null when unknown. */
+export function getMessageLocation(messageId: string): { platformId: string; threadId: string } | null {
+  const db = openDb();
+  try {
+    const row = db.prepare(`SELECT platform_id, thread_id FROM web_messages WHERE id = ?`).get(messageId) as
+      | { platform_id: string; thread_id: string }
+      | undefined;
+    return row ? { platformId: row.platform_id, threadId: row.thread_id } : null;
+  } finally {
+    db.close();
+  }
 }
 
 function sanitizeStorageName(name: string, index: number): string {

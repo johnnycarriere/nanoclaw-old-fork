@@ -138,23 +138,25 @@ vi.mock('../db/messaging-groups.js', () => ({
 }));
 
 vi.mock('../router.js', () => ({
-  routeInbound: vi.fn(async (event: {
-    platformId: string;
-    threadId: string | null;
-    message: { id: string; kind: 'chat' | 'chat-sdk'; content: string; timestamp: string; isGroup?: boolean };
-  }) => {
-    routeCaptures.push({
-      platformId: event.platformId,
-      threadId: event.threadId,
-      message: {
-        id: event.message.id,
-        kind: event.message.kind,
-        content: JSON.parse(event.message.content),
-        timestamp: event.message.timestamp,
-        isGroup: event.message.isGroup,
-      },
-    });
-  }),
+  routeInbound: vi.fn(
+    async (event: {
+      platformId: string;
+      threadId: string | null;
+      message: { id: string; kind: 'chat' | 'chat-sdk'; content: string; timestamp: string; isGroup?: boolean };
+    }) => {
+      routeCaptures.push({
+        platformId: event.platformId,
+        threadId: event.threadId,
+        message: {
+          id: event.message.id,
+          kind: event.message.kind,
+          content: JSON.parse(event.message.content),
+          timestamp: event.message.timestamp,
+          isGroup: event.message.isGroup,
+        },
+      });
+    },
+  ),
 }));
 
 import {
@@ -167,7 +169,7 @@ import {
   rewriteWebchatPublicPaths,
   shouldMirrorApprovalToOrigin,
 } from './web.js';
-import type { ChannelSetup, InboundMessage } from './adapter.js';
+import type { ChannelSetup } from './adapter.js';
 import { routeInbound } from '../router.js';
 import { cleanupAgentSessionsForThread } from '../webchat-thread-cleanup.js';
 import { getDb, hasTable } from '../db/connection.js';
@@ -180,8 +182,19 @@ import { resetUploadStateForTests, getStagedUpload } from '../webchat-uploads.js
 import * as agentGroups from '../db/agent-groups.js';
 import * as webchatSync from '../webchat-sync.js';
 import * as webchatMentions from '../webchat-mentions.js';
-import { resetWebchatAuthSchemaForTests, createSession, signSessionCookie, WEBCHAT_SESSION_COOKIE } from '../webchat-auth-sessions.js';
-import { createWebchatMcpOAuthBackend, MCP_DEFAULT_SCOPE, verifyMcpAccessToken } from '../webchat-mcp-oauth.js';
+import {
+  resetWebchatAuthSchemaForTests,
+  createSession,
+  signSessionCookie,
+  WEBCHAT_SESSION_COOKIE,
+} from '../webchat-auth-sessions.js';
+import { resetLoginRateLimitForTests } from '../webchat-auth.js';
+import {
+  createWebchatMcpOAuthBackend,
+  MCP_CONSENT_PATH,
+  MCP_DEFAULT_SCOPE,
+  verifyMcpAccessToken,
+} from '../webchat-mcp-oauth.js';
 import { encodeUserSuffix } from '../webchat-room-scope.js';
 import * as webchatRoomScope from '../webchat-room-scope.js';
 import { isOwner, isGlobalAdmin, hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
@@ -277,7 +290,11 @@ async function reservePort(): Promise<number> {
   });
 }
 
-function httpPostJson(path: string, body: unknown, port = testPort): Promise<{ status: number; body: Record<string, unknown> }> {
+function httpPostJson(
+  path: string,
+  body: unknown,
+  port = testPort,
+): Promise<{ status: number; body: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -318,7 +335,9 @@ function httpMultipartUpload(
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const boundary = '----WebKitFormBoundaryTestUpload';
   const body = Buffer.concat([
-    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+    ),
     content,
     Buffer.from(`\r\n--${boundary}--\r\n`),
   ]);
@@ -647,14 +666,15 @@ describe('web channel adapter', () => {
   beforeEach(async () => {
     clearWebAdapterTestState();
     resetUploadStateForTests();
+    resetLoginRateLimitForTests();
     captures.length = 0;
     actionCaptures.length = 0;
     getDbMock.mockReset();
     getDbMock.mockReturnValue({} as ReturnType<typeof getDb>);
     hasTableMock.mockReset();
-    hasTableMock.mockImplementation((_db: unknown, table: string) => table === 'pending_approvals');
+    hasTableMock.mockImplementation(async (_db: unknown, table: string) => table === 'pending_approvals');
     getAgentGroupMock.mockReset();
-    getAgentGroupMock.mockImplementation((id: string) => {
+    getAgentGroupMock.mockImplementation(async (id: string) => {
       if (id === 'ag-sarah') {
         return { id: 'ag-sarah', folder: 'sarah', name: 'Sarah', agent_provider: null, created_at: '2020-01-01' };
       }
@@ -801,6 +821,31 @@ describe('web channel adapter', () => {
     });
   });
 
+  it('serves html attachments as text/plain downloads, never as a page', async () => {
+    await adapter.setup(setup);
+    const posted = await httpPostJson('/api/rooms/lobby/threads/main/messages', {
+      text: 'see attached',
+      attachments: [
+        {
+          name: 'page.html',
+          mimeType: 'text/html',
+          type: 'file',
+          data: Buffer.from('<script>alert(document.cookie)</script>').toString('base64'),
+        },
+      ],
+    });
+    expect(posted.status).toBe(200);
+    const url = (posted.body as { attachments: Array<{ url: string }> }).attachments[0]!.url;
+
+    const res = await httpGetWithHeaders(`${url}?token=${SECRET}`, {});
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('text/plain; charset=utf-8');
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename="page\.html"/);
+    expect(res.headers['content-security-policy']).toBe('sandbox');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(String(res.body)).toContain('<script>');
+  });
+
   it('accepts non-image inbound attachments such as PDF', async () => {
     await adapter.setup(setup);
     const status = await httpPost('/api/rooms/lobby/threads/thread_abc/messages', {
@@ -844,11 +889,13 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', 'thread_abc', {
-          kind: 'chat',
-          content: { text: 'Agent reply' },
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', 'thread_abc', {
+            kind: 'chat',
+            content: { text: 'Agent reply' },
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -871,11 +918,13 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', 'thread_abc', {
-          kind: 'chat',
-          content: { text: 'On it', senderName: 'Diego' },
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', 'thread_abc', {
+            kind: 'chat',
+            content: { text: 'On it', senderName: 'Diego' },
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -897,12 +946,14 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', 'thread_abc', {
-          kind: 'chat',
-          content: { text: 'Here is the chart' },
-          files: [{ filename: 'chart.png', data: Buffer.from('fake-png') }],
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', 'thread_abc', {
+            kind: 'chat',
+            content: { text: 'Here is the chart' },
+            files: [{ filename: 'chart.png', data: Buffer.from('fake-png') }],
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -935,12 +986,14 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', 'thread_abc', {
-          kind: 'chat',
-          content: { text: '' },
-          files: [{ filename: 'report.pdf', data: Buffer.from('%PDF-1.4') }],
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', 'thread_abc', {
+            kind: 'chat',
+            content: { text: '' },
+            files: [{ filename: 'report.pdf', data: Buffer.from('%PDF-1.4') }],
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -1115,9 +1168,10 @@ describe('web channel adapter', () => {
       'thanks both',
       'thanks both',
     ]);
-    expect(
-      liveCaptures.map((c) => (c.message.content as { webchatReceiver: string }).webchatReceiver).sort(),
-    ).toEqual(['diego', 'sarah']);
+    expect(liveCaptures.map((c) => (c.message.content as { webchatReceiver: string }).webchatReceiver).sort()).toEqual([
+      'diego',
+      'sarah',
+    ]);
   });
 
   it('explicit @mention routes to all engaged agents with per-receiver metadata', async () => {
@@ -1161,8 +1215,10 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await httpPost('/api/rooms/lobby/threads/thread_abc/messages', { text: '@sarah hello' });
+      ws.on('open', () => {
+        void (async () => {
+          await httpPost('/api/rooms/lobby/threads/thread_abc/messages', { text: '@sarah hello' });
+        })();
       });
       ws.on('message', (data) => {
         const event = JSON.parse(data.toString()) as { type: string };
@@ -1226,8 +1282,14 @@ describe('web channel adapter', () => {
 
     const stub = diegoDeliveries.find((c) => c.message.id.includes('backfill-stub'));
     const intro = diegoDeliveries.find((c) => c.message.id.includes('backfill-intro'));
-    const replayOne = diegoDeliveries.find((c) => c.message.id.includes('backfill-replay') && (c.message.content as { text: string }).text.includes('hello one'));
-    const replayTwo = diegoDeliveries.find((c) => c.message.id.includes('backfill-replay') && (c.message.content as { text: string }).text === 'follow up two');
+    const replayOne = diegoDeliveries.find(
+      (c) =>
+        c.message.id.includes('backfill-replay') && (c.message.content as { text: string }).text.includes('hello one'),
+    );
+    const replayTwo = diegoDeliveries.find(
+      (c) =>
+        c.message.id.includes('backfill-replay') && (c.message.content as { text: string }).text === 'follow up two',
+    );
     const live = diegoDeliveries.find((c) => c.message.id.includes('-route-'));
     expect(stub).toBeDefined();
     expect(intro).toBeDefined();
@@ -1351,36 +1413,6 @@ describe('web channel adapter', () => {
     });
   });
 
-  it('does not fan out provider session-limit notices to peer agents', async () => {
-    await adapter.setup(setup);
-    await httpPost('/api/rooms/lobby/threads/thread_abc/messages', { text: '@sarah @diego sync' });
-    await flushAgentDeliveries();
-    captures.length = 0;
-
-    await adapter.deliver('lobby', 'thread_abc', {
-      kind: 'chat',
-      content: {
-        text: "You've hit your session limit · resets 1:10pm (America/Los_Angeles)",
-        senderName: 'Sarah',
-        senderFolder: 'sarah',
-      },
-    });
-    await flushAgentDeliveries();
-    expect(captures.some((c) => c.message.id.startsWith('web-peer-'))).toBe(false);
-
-    await adapter.deliver('lobby', 'thread_abc', {
-      kind: 'chat',
-      content: {
-        text: 'Quota exhausted',
-        senderName: 'Diego',
-        senderFolder: 'diego',
-        skipPeerFanOut: true,
-      },
-    });
-    await flushAgentDeliveries();
-    expect(captures.some((c) => c.message.id.startsWith('web-peer-'))).toBe(false);
-  });
-
   it('returns 401 for API requests without Bearer token', async () => {
     await adapter.setup(setup);
     const { status } = await httpGetText('/api/rooms/lobby/threads/main/messages', testPort);
@@ -1435,8 +1467,10 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.setTyping!('lobby', 'thread_abc');
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.setTyping!('lobby', 'thread_abc');
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -1446,172 +1480,6 @@ describe('web channel adapter', () => {
       ws.on('error', reject);
     });
     expect(received[0]).toMatchObject({ type: 'typing', platformId: 'lobby', threadId: 'thread_abc' });
-  });
-
-  it('broadcasts and persists activity via publishActivity', async () => {
-    await adapter.setup(setup);
-    const event = {
-      turnId: 'turn-1',
-      seq: 1,
-      timestamp: new Date().toISOString(),
-      kind: 'tool_start' as const,
-      summary: 'Running Bash',
-      tool: 'Bash',
-    };
-    const received: unknown[] = [];
-    await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await (
-          adapter as unknown as {
-            publishActivity: (
-              platformId: string,
-              threadId: string | null,
-              ev: typeof event,
-            ) => Promise<void>;
-          }
-        ).publishActivity('lobby', 'thread_abc', event);
-      });
-      ws.on('message', (data) => {
-        received.push(JSON.parse(data.toString()));
-        ws.close();
-        resolve();
-      });
-      ws.on('error', reject);
-    });
-    expect(received[0]).toMatchObject({
-      type: 'activity',
-      platformId: 'lobby',
-      threadId: 'thread_abc',
-      event: { kind: 'tool_start', summary: 'Running Bash', tool: 'Bash' },
-    });
-    const { status, body } = await httpGet('/api/rooms/lobby/threads/thread_abc/activity');
-    expect(status).toBe(200);
-    const parsed = body as { events: Array<{ turnId: string }> };
-    expect(parsed.events.some((e) => e.turnId === 'turn-1')).toBe(true);
-  });
-
-  it('does not persist keepalive activity and clears by turn or room', async () => {
-    await adapter.setup(setup);
-    const duck = adapter as unknown as {
-      publishActivity: (
-        platformId: string,
-        threadId: string | null,
-        event: {
-          turnId: string;
-          seq: number;
-          timestamp: string;
-          kind: string;
-          summary: string;
-          keepalive?: boolean;
-        },
-      ) => Promise<void>;
-      clearActivity: (
-        platformId: string,
-        threadId: string | null,
-        turnId?: string,
-      ) => Promise<void>;
-    };
-
-    await duck.publishActivity('lobby', null, {
-      turnId: 'turn-keep',
-      seq: 1,
-      timestamp: new Date().toISOString(),
-      kind: 'keepalive',
-      summary: 'Working',
-      keepalive: true,
-    });
-    let listed = await httpGet('/api/rooms/lobby/threads/main/activity');
-    expect((listed.body as { events: unknown[] }).events).toEqual([]);
-
-    await duck.publishActivity('lobby', null, {
-      turnId: 'turn-keep',
-      seq: 2,
-      timestamp: new Date().toISOString(),
-      kind: 'tool_start',
-      summary: 'Bash',
-    });
-    listed = await httpGet('/api/rooms/lobby/threads/main/activity');
-    expect((listed.body as { events: Array<{ turnId: string }> }).events).toHaveLength(1);
-
-    const cleared: unknown[] = [];
-    await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await duck.clearActivity('lobby', null, 'turn-keep');
-      });
-      ws.on('message', (data) => {
-        cleared.push(JSON.parse(data.toString()));
-        ws.close();
-        resolve();
-      });
-      ws.on('error', reject);
-    });
-    expect(cleared[0]).toMatchObject({
-      type: 'activity_clear',
-      platformId: 'lobby',
-      threadId: 'main',
-      turnId: 'turn-keep',
-    });
-    listed = await httpGet('/api/rooms/lobby/threads/main/activity');
-    expect((listed.body as { events: unknown[] }).events).toEqual([]);
-
-    await duck.publishActivity('lobby', null, {
-      turnId: 'turn-2',
-      seq: 1,
-      timestamp: new Date().toISOString(),
-      kind: 'tool_start',
-      summary: 'Grep',
-    });
-    await duck.clearActivity('lobby', null);
-    listed = await httpGet('/api/rooms/lobby/threads/main/activity');
-    expect((listed.body as { events: unknown[] }).events).toEqual([]);
-  });
-
-  it('setTyping includes DM folder agents when nothing is engaged', async () => {
-    await adapter.setup(setup);
-    const received: unknown[] = [];
-    await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.setTyping!('dm:sarah', 'main');
-      });
-      ws.on('message', (data) => {
-        received.push(JSON.parse(data.toString()));
-        ws.close();
-        resolve();
-      });
-      ws.on('error', reject);
-    });
-    expect(received[0]).toMatchObject({
-      type: 'typing',
-      platformId: 'dm:sarah',
-      threadId: 'main',
-      agents: ['sarah'],
-    });
-  });
-
-  it('setTyping omits agents for malformed dm platform ids', async () => {
-    await adapter.setup(setup);
-    const received: unknown[] = [];
-    await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.setTyping!('dm:', 'main');
-      });
-      ws.on('message', (data) => {
-        received.push(JSON.parse(data.toString()));
-        ws.close();
-        resolve();
-      });
-      ws.on('error', reject);
-    });
-    expect(received[0]).toMatchObject({
-      type: 'typing',
-      platformId: 'dm:',
-      threadId: 'main',
-    });
-    expect(received[0]).not.toHaveProperty('agents');
   });
 
   it('serves static assets with correct Content-Type', async () => {
@@ -1746,11 +1614,7 @@ describe('web channel adapter', () => {
   it('accepts multipart upload and message with uploadId reference', async () => {
     await adapter.setup(setup);
     const fileBytes = Buffer.from('uploaded-image-bytes');
-    const upload = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/main/uploads',
-      'photo.png',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload('/api/rooms/lobby/threads/main/uploads', 'photo.png', fileBytes);
     expect(upload.status).toBe(200);
     expect(upload.body.uploadId).toBeTruthy();
 
@@ -1768,9 +1632,9 @@ describe('web channel adapter', () => {
     });
     expect(post.status).toBe(200);
     expect(post.body.messageId).toBeTruthy();
-    expect(
-      (post.body.attachments as Array<{ url?: string; name: string }> | undefined)?.[0]?.url,
-    ).toMatch(/^\/api\/attachments\//);
+    expect((post.body.attachments as Array<{ url?: string; name: string }> | undefined)?.[0]?.url).toMatch(
+      /^\/api\/attachments\//,
+    );
 
     const { body } = await httpGet('/api/rooms/lobby/threads/main/messages');
     const messages = (body as { messages: Array<{ attachments?: Array<{ url?: string; name: string }> }> }).messages;
@@ -1782,11 +1646,7 @@ describe('web channel adapter', () => {
   it('posts a message referencing a staged upload', async () => {
     await adapter.setup(setup);
     const fileBytes = Buffer.from('hello-upload');
-    const upload = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/main/uploads',
-      'note.txt',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload('/api/rooms/lobby/threads/main/uploads', 'note.txt', fileBytes);
     expect(upload.status).toBe(200);
 
     const status = await httpPost('/api/rooms/lobby/threads/main/messages', {
@@ -1899,11 +1759,7 @@ describe('web channel adapter', () => {
     expect(createRes.status).toBe(200);
     const threadId = createRes.body.id;
     const fileBytes = Buffer.from('thread-scoped');
-    const upload = await httpMultipartUpload(
-      `/api/rooms/lobby/threads/${threadId}/uploads`,
-      'scoped.txt',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload(`/api/rooms/lobby/threads/${threadId}/uploads`, 'scoped.txt', fileBytes);
     expect(upload.status).toBe(200);
     const status = await httpPost('/api/rooms/lobby/threads/main/messages', {
       text: 'wrong thread',
@@ -1923,11 +1779,7 @@ describe('web channel adapter', () => {
   it('restores consumed uploads when duplicate uploadId references cannot both be consumed', async () => {
     await adapter.setup(setup);
     const fileBytes = Buffer.from('dup-ref');
-    const upload = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/main/uploads',
-      'dup.txt',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload('/api/rooms/lobby/threads/main/uploads', 'dup.txt', fileBytes);
     expect(upload.status).toBe(200);
     const uploadId = upload.body.uploadId as string;
     const dupRef = {
@@ -1954,11 +1806,7 @@ describe('web channel adapter', () => {
   it('rejects upload references with mismatched metadata', async () => {
     await adapter.setup(setup);
     const fileBytes = Buffer.from('meta-check');
-    const upload = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/main/uploads',
-      'meta.txt',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload('/api/rooms/lobby/threads/main/uploads', 'meta.txt', fileBytes);
     expect(upload.status).toBe(200);
     const status = await httpPost('/api/rooms/lobby/threads/main/messages', {
       text: 'bad meta',
@@ -1978,11 +1826,7 @@ describe('web channel adapter', () => {
   it('routes upload-referenced attachments without inline data when disk read fails', async () => {
     await adapter.setup(setup);
     const fileBytes = Buffer.from('route-me');
-    const upload = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/thread_abc/uploads',
-      'route.txt',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload('/api/rooms/lobby/threads/thread_abc/uploads', 'route.txt', fileBytes);
     expect(upload.status).toBe(200);
     const originalRead = fs.readFileSync.bind(fs);
     vi.spyOn(fs, 'readFileSync').mockImplementation((filePath, ...args) => {
@@ -2017,11 +1861,7 @@ describe('web channel adapter', () => {
   it('routes large uploaded attachments without inline agent data', async () => {
     await adapter.setup(setup);
     const fileBytes = Buffer.alloc(5 * 1024 * 1024 + 1, 1);
-    const upload = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/thread_abc/uploads',
-      'big.bin',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload('/api/rooms/lobby/threads/thread_abc/uploads', 'big.bin', fileBytes);
     expect(upload.status).toBe(200);
     captures.length = 0;
     const status = await httpPost('/api/rooms/lobby/threads/thread_abc/messages', {
@@ -2040,8 +1880,7 @@ describe('web channel adapter', () => {
     await flushAgentDeliveries();
     const live = captures.find((c) => c.message.id.includes('-route-'));
     expect(live).toBeDefined();
-    const attachments = (live!.message.content as { attachments?: Array<{ data?: string; size: number }> })
-      .attachments;
+    const attachments = (live!.message.content as { attachments?: Array<{ data?: string; size: number }> }).attachments;
     expect(attachments?.[0]?.size).toBeGreaterThan(5 * 1024 * 1024);
     expect(attachments?.[0]?.data).toBeUndefined();
   });
@@ -2191,11 +2030,7 @@ describe('web channel adapter', () => {
     await adapter.setup(setup);
     const store = await import('../webchat-store.js');
     const fileBytes = Buffer.from('rollback-me');
-    const upload = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/main/uploads',
-      'rollback.txt',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload('/api/rooms/lobby/threads/main/uploads', 'rollback.txt', fileBytes);
     expect(upload.status).toBe(200);
     const moveSpy = vi.spyOn(store, 'moveAttachmentIntoMessage').mockImplementation(() => {
       throw new Error('move failed');
@@ -2235,11 +2070,7 @@ describe('web channel adapter', () => {
     await adapter.setup(setup);
     const store = await import('../webchat-store.js');
     const fileBytes = Buffer.from('moved-first');
-    const upload = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/main/uploads',
-      'moved-first.txt',
-      fileBytes,
-    );
+    const upload = await httpMultipartUpload('/api/rooms/lobby/threads/main/uploads', 'moved-first.txt', fileBytes);
     expect(upload.status).toBe(200);
     const uploadId = upload.body.uploadId as string;
     const writeSpy = vi.spyOn(store, 'writeAttachmentFiles').mockImplementation(() => {
@@ -2274,16 +2105,8 @@ describe('web channel adapter', () => {
     const store = await import('../webchat-store.js');
     const firstBytes = Buffer.from('first-upload');
     const secondBytes = Buffer.from('second-upload');
-    const first = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/main/uploads',
-      'first.txt',
-      firstBytes,
-    );
-    const second = await httpMultipartUpload(
-      '/api/rooms/lobby/threads/main/uploads',
-      'second.txt',
-      secondBytes,
-    );
+    const first = await httpMultipartUpload('/api/rooms/lobby/threads/main/uploads', 'first.txt', firstBytes);
+    const second = await httpMultipartUpload('/api/rooms/lobby/threads/main/uploads', 'second.txt', secondBytes);
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
     const firstId = first.body.uploadId as string;
@@ -2410,8 +2233,7 @@ describe('web channel adapter', () => {
     await flushAgentDeliveries();
     const replay = captures.find(
       (c) =>
-        c.message.id.includes('backfill-replay') &&
-        (c.message.content as { text?: string }).text === 'Agent reply',
+        c.message.id.includes('backfill-replay') && (c.message.content as { text?: string }).text === 'Agent reply',
     );
     expect(replay).toBeDefined();
     expect(replay!.message.content).toMatchObject({
@@ -2819,8 +2641,10 @@ describe('web channel adapter', () => {
     await adapter.setup(setup);
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.setTyping!('lobby', null);
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.setTyping!('lobby', null);
+        })();
       });
       ws.on('message', (data) => {
         const event = JSON.parse(data.toString()) as { type: string; threadId: string };
@@ -2933,8 +2757,7 @@ describe('web channel adapter', () => {
     await flushAgentDeliveries();
     const replay = captures.find(
       (c) =>
-        c.message.id.includes('backfill-replay') &&
-        (c.message.content as { text?: string }).text?.includes('look'),
+        c.message.id.includes('backfill-replay') && (c.message.content as { text?: string }).text?.includes('look'),
     );
     expect(replay).toBeDefined();
     const att = (replay!.message.content as { attachments: Array<{ data?: string }> }).attachments![0]!;
@@ -2961,8 +2784,7 @@ describe('web channel adapter', () => {
       await flushAgentDeliveries();
       const replay = captures.find(
         (c) =>
-          c.message.id.includes('backfill-replay') &&
-          (c.message.content as { text?: string }).text?.includes('look'),
+          c.message.id.includes('backfill-replay') && (c.message.content as { text?: string }).text?.includes('look'),
       );
       expect(replay).toBeDefined();
       const att = (replay!.message.content as { attachments: Array<{ data?: string; name: string }> }).attachments![0]!;
@@ -2987,9 +2809,7 @@ describe('web channel adapter', () => {
     await adapter.setup(setup);
     const origFrom = Buffer.from.bind(Buffer);
     // Only intercept base64 decodes in validateInboundAttachments, not other Buffer.from callers.
-    const fromSpy = vi.spyOn(Buffer, 'from').mockImplementation(((
-      ...args: unknown[]
-    ) => {
+    const fromSpy = vi.spyOn(Buffer, 'from').mockImplementation(((...args: unknown[]) => {
       if (args[1] === 'base64') throw new Error('invalid base64');
       return (origFrom as (...a: unknown[]) => Buffer)(...args);
     }) as typeof Buffer.from);
@@ -3026,7 +2846,7 @@ describe('web channel adapter', () => {
   });
 
   it('deletes thread without session cleanup when messaging group is missing', async () => {
-    getMessagingGroupMock.mockReturnValueOnce(undefined);
+    getMessagingGroupMock.mockResolvedValueOnce(undefined);
     await adapter.setup(setup);
     const createRes = await new Promise<{ status: number; body: { id: string } }>((resolve, reject) => {
       const req = http.request(
@@ -3208,15 +3028,17 @@ describe('web channel adapter', () => {
   it('routes follow-ups for engaged folders missing from the current agent roster', async () => {
     await adapter.setup(setup);
     webchatStore.addEngagedAgents('lobby', 'thread_abc', ['orphan']);
-    const groupsSpy = vi.spyOn(agentGroups, 'getAllAgentGroups').mockReturnValue([
-      { id: 'ag-sarah', folder: 'sarah', name: 'Sarah', agent_provider: null, created_at: '2020-01-01' },
-    ]);
+    const groupsSpy = vi
+      .spyOn(agentGroups, 'getAllAgentGroups')
+      .mockResolvedValue([
+        { id: 'ag-sarah', folder: 'sarah', name: 'Sarah', agent_provider: null, created_at: '2020-01-01' },
+      ]);
     try {
       await httpPost('/api/rooms/lobby/threads/thread_abc/messages', { text: 'hello everyone' });
       await flushAgentDeliveries();
-      expect(captures.some((c) => (c.message.content as { webchatReceiver?: string }).webchatReceiver === 'orphan')).toBe(
-        true,
-      );
+      expect(
+        captures.some((c) => (c.message.content as { webchatReceiver?: string }).webchatReceiver === 'orphan'),
+      ).toBe(true);
     } finally {
       groupsSpy.mockRestore();
     }
@@ -3231,8 +3053,7 @@ describe('web channel adapter', () => {
     await flushAgentDeliveries();
     const replay = captures.find(
       (c) =>
-        c.message.id.includes('backfill-replay') &&
-        (c.message.content as { text?: string }).text === 'Unnamed reply',
+        c.message.id.includes('backfill-replay') && (c.message.content as { text?: string }).text === 'Unnamed reply',
     );
     expect(replay).toBeDefined();
     expect((replay!.message.content as { sender?: string }).sender).toBe('Agent');
@@ -3408,20 +3229,22 @@ describe('web channel adapter', () => {
     const received: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        await adapter.deliver('inbox', null, {
-          kind: 'chat-sdk',
-          content: {
-            type: 'ask_question',
-            questionId: 'approval-1',
-            title: 'Install MCP server',
-            question: 'Add memory server?',
-            options: [
-              { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
-              { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
-            ],
-          },
-        });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('inbox', null, {
+            kind: 'chat-sdk',
+            content: {
+              type: 'ask_question',
+              questionId: 'approval-1',
+              title: 'Install MCP server',
+              question: 'Add memory server?',
+              options: [
+                { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+                { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+              ],
+            },
+          });
+        })();
       });
       ws.on('message', (data) => {
         received.push(JSON.parse(data.toString()));
@@ -3484,9 +3307,7 @@ describe('web channel adapter', () => {
       ws.on('error', reject);
     });
 
-    expect(actionCaptures).toEqual([
-      { questionId: 'approval-2', value: 'approve', userId: 'web:local' },
-    ]);
+    expect(actionCaptures).toEqual([{ questionId: 'approval-2', value: 'approve', userId: 'web:local' }]);
     expect(events.some((e) => (e as { type?: string }).type === 'message_update')).toBe(true);
   });
 
@@ -3620,9 +3441,7 @@ describe('web channel adapter', () => {
     await expect(adapter.openDM!(userId)).resolves.toBe(`inbox:${encodeUserSuffix(userId)}`);
     // Host ensureUserDm strips the "web:" channel prefix before calling openDM.
     await expect(adapter.openDM!('basic:alice')).resolves.toBe(`inbox:${encodeUserSuffix(userId)}`);
-    await expect(adapter.openDM!('System')).resolves.toBe(
-      `inbox:${encodeUserSuffix('web:System')}`,
-    );
+    await expect(adapter.openDM!('System')).resolves.toBe(`inbox:${encodeUserSuffix('web:System')}`);
   });
 
   it('openDM reconstructs web user ids for stripped handles in public mode', async () => {
@@ -3630,9 +3449,7 @@ describe('web channel adapter', () => {
     resetWebchatAuthSchemaForTests();
     await adapter.setup(setup);
     // Even unexpected handles are treated as web user suffixes (web adapter only).
-    await expect(adapter.openDM!('telegram:123')).resolves.toBe(
-      `inbox:${encodeUserSuffix('web:telegram:123')}`,
-    );
+    await expect(adapter.openDM!('telegram:123')).resolves.toBe(`inbox:${encodeUserSuffix('web:telegram:123')}`);
   });
 
   it('returns 401 for protected API routes without session in public mode', async () => {
@@ -3672,17 +3489,14 @@ describe('web channel adapter', () => {
     await adapter.deliver(aliceInbox, null, { kind: 'chat', content: 'private for alice' });
 
     await vi.waitFor(() => {
-      expect(
-        aliceClient.events.some((event) => (event as { type?: string }).type === 'message'),
-      ).toBe(true);
+      expect(aliceClient.events.some((event) => (event as { type?: string }).type === 'message')).toBe(true);
     });
-    expect(
-      bobClient.events.some((event) => (event as { type?: string }).type === 'message'),
-    ).toBe(false);
+    expect(bobClient.events.some((event) => (event as { type?: string }).type === 'message')).toBe(false);
 
-    const privateEvent = aliceClient.events.find(
-      (event) => (event as { type?: string }).type === 'message',
-    ) as { forUserId?: string; message?: { platformId?: string } };
+    const privateEvent = aliceClient.events.find((event) => (event as { type?: string }).type === 'message') as {
+      forUserId?: string;
+      message?: { platformId?: string };
+    };
     expect(privateEvent.forUserId).toBe('web:basic:alice');
     expect(privateEvent.message?.platformId).toBe('inbox');
 
@@ -3707,65 +3521,6 @@ describe('web channel adapter', () => {
     bobClient.ws.close();
   });
 
-  it('broadcasts activity and typing with logical platform ids in public mode', async () => {
-    adapter = createWebAdapter(publicAdapterOptions(testPort));
-    resetWebchatAuthSchemaForTests();
-    await adapter.setup(setup);
-
-    const cookie = await loginBasicSession('alice');
-    const client = await openWsWithCookie(cookie);
-    const duck = adapter as unknown as {
-      publishActivity: (
-        platformId: string,
-        threadId: string | null,
-        event: {
-          turnId: string;
-          seq: number;
-          timestamp: string;
-          kind: string;
-          summary: string;
-        },
-      ) => Promise<void>;
-      clearActivity: (
-        platformId: string,
-        threadId: string | null,
-        turnId?: string,
-      ) => Promise<void>;
-    };
-
-    const aliceInbox = `inbox:${encodeUserSuffix('web:basic:alice')}`;
-    await adapter.setTyping!(aliceInbox, 'main');
-    await duck.publishActivity(aliceInbox, 'main', {
-      turnId: 'pub-1',
-      seq: 1,
-      timestamp: new Date().toISOString(),
-      kind: 'tool_start',
-      summary: 'Public Bash',
-    });
-    await duck.clearActivity(aliceInbox, 'main', 'pub-1');
-
-    await vi.waitFor(() => {
-      expect(client.events.some((e) => (e as { type?: string }).type === 'typing')).toBe(true);
-      expect(client.events.some((e) => (e as { type?: string }).type === 'activity')).toBe(true);
-      expect(client.events.some((e) => (e as { type?: string }).type === 'activity_clear')).toBe(true);
-    });
-
-    const typing = client.events.find((e) => (e as { type?: string }).type === 'typing') as {
-      platformId?: string;
-    };
-    const activity = client.events.find((e) => (e as { type?: string }).type === 'activity') as {
-      platformId?: string;
-    };
-    const clear = client.events.find((e) => (e as { type?: string }).type === 'activity_clear') as {
-      platformId?: string;
-    };
-    expect(typing.platformId).toBe('inbox');
-    expect(activity.platformId).toBe('inbox');
-    expect(clear.platformId).toBe('inbox');
-
-    client.ws.close();
-  });
-
   it('returns 403 when session user accesses another users scoped room', async () => {
     adapter = createWebAdapter(publicAdapterOptions(testPort));
     resetWebchatAuthSchemaForTests();
@@ -3773,10 +3528,9 @@ describe('web channel adapter', () => {
 
     const bobCookie = await loginBasicSession('bob');
     const aliceInboxPhysical = encodeURIComponent(`inbox:${encodeUserSuffix('web:basic:alice')}`);
-    const forbidden = await httpGetWithHeaders(
-      `/api/rooms/${aliceInboxPhysical}/threads/main/messages`,
-      { Cookie: bobCookie },
-    );
+    const forbidden = await httpGetWithHeaders(`/api/rooms/${aliceInboxPhysical}/threads/main/messages`, {
+      Cookie: bobCookie,
+    });
     expect(forbidden.status).toBe(403);
 
     const forbiddenAction = await httpPostJsonWithHeaders(
@@ -3786,10 +3540,9 @@ describe('web channel adapter', () => {
     );
     expect(forbiddenAction.status).toBe(403);
 
-    const forbiddenDelete = await httpDeleteWithHeaders(
-      `/api/rooms/${aliceInboxPhysical}/threads/main`,
-      { Cookie: bobCookie },
-    );
+    const forbiddenDelete = await httpDeleteWithHeaders(`/api/rooms/${aliceInboxPhysical}/threads/main`, {
+      Cookie: bobCookie,
+    });
     expect(forbiddenDelete.status).toBe(403);
 
     const forbiddenPatch = await httpPatchWithHeaders(
@@ -3850,8 +3603,10 @@ describe('web channel adapter', () => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws`, {
         headers: { Cookie: cookie },
       });
-      ws.on('open', async () => {
-        await adapter.deliver('lobby', null, { kind: 'chat', content: 'lobby hello' });
+      ws.on('open', () => {
+        void (async () => {
+          await adapter.deliver('lobby', null, { kind: 'chat', content: 'lobby hello' });
+        })();
       });
       ws.on('message', (data) => {
         events.push(JSON.parse(String(data)));
@@ -3994,7 +3749,7 @@ describe('web channel adapter', () => {
     expect(font.body).toBe('font');
   });
 
-  it('accepts bearer token for bootstrap when session is absent in public mode', async () => {
+  it('ignores the static WEBCHAT_SECRET entirely in public mode', async () => {
     adapter = createWebAdapter(publicAdapterOptions(testPort));
     resetWebchatAuthSchemaForTests();
     await adapter.setup(setup);
@@ -4002,11 +3757,67 @@ describe('web channel adapter', () => {
     const bootstrap = await httpGetWithHeaders('/api/bootstrap', {
       Authorization: `Bearer ${SECRET}`,
     });
-    expect(bootstrap.status).toBe(200);
-    expect(bootstrap.body).toMatchObject({
-      authMode: 'public',
-      user: { id: 'web:local', displayName: 'Local' },
-    });
+    expect(bootstrap.status).toBe(401);
+
+    const viaQuery = await httpGetWithHeaders(`/api/bootstrap?token=${SECRET}`, {});
+    expect(viaQuery.status).toBe(401);
+
+    const attachment = await httpGetWithHeaders(`/api/attachments/missing/file.png?token=${SECRET}`, {});
+    expect(attachment.status).toBe(401);
+
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
+        ws.on('open', () => {
+          ws.close();
+          resolve();
+        });
+        ws.on('error', reject);
+      }),
+    ).rejects.toThrow(/401/);
+
+    // A real session still works.
+    const cookie = await loginBasicSession('alice');
+    const ok = await httpGetWithHeaders('/api/bootstrap', { Cookie: cookie });
+    expect(ok.status).toBe(200);
+  });
+
+  it('rejects WebSocket upgrades whose Origin does not match the public base URL', async () => {
+    adapter = createWebAdapter(publicAdapterOptions(testPort));
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+    const cookie = await loginBasicSession('alice');
+
+    const tryOrigin = (origin: string) =>
+      new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws`, { headers: { Cookie: cookie, Origin: origin } });
+        ws.on('open', () => {
+          ws.close();
+          resolve();
+        });
+        ws.on('error', reject);
+      });
+
+    await expect(tryOrigin('https://evil.example')).rejects.toThrow(/403/);
+    await expect(tryOrigin(`http://127.0.0.1:${testPort + 1}`)).rejects.toThrow(/403/);
+    await expect(tryOrigin(`http://127.0.0.1:${testPort}`)).resolves.toBeUndefined();
+  });
+
+  it('rejects WebSocket upgrades from non-loopback Origins in local mode', async () => {
+    await adapter.setup(setup);
+    const tryOrigin = (origin: string) =>
+      new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`, { headers: { Origin: origin } });
+        ws.on('open', () => {
+          ws.close();
+          resolve();
+        });
+        ws.on('error', reject);
+      });
+    await expect(tryOrigin('http://attacker.example')).rejects.toThrow(/403/);
+    await expect(tryOrigin('not a url')).rejects.toThrow(/403/);
+    await expect(tryOrigin(`http://localhost:${testPort}`)).resolves.toBeUndefined();
+    await expect(tryOrigin(`http://127.0.0.1:${testPort}`)).resolves.toBeUndefined();
   });
 
   it('broadcasts message_update over session-scoped WebSocket in public mode', async () => {
@@ -4076,22 +3887,25 @@ describe('web channel adapter', () => {
     expect(messages.some((msg) => msg.text === 'hello from alice')).toBe(true);
   });
 
-  it('does not deliver private-room events to unscoped bearer WebSocket clients in public mode', async () => {
+  it('does not deliver private-room events to other users over WebSocket in public mode', async () => {
     adapter = createWebAdapter(publicAdapterOptions(testPort));
     resetWebchatAuthSchemaForTests();
     await adapter.setup(setup);
 
+    const bobCookie = await loginBasicSession('bob');
     const events: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        const aliceInbox = `inbox:${encodeUserSuffix('web:basic:alice')}`;
-        await adapter.deliver(aliceInbox, null, { kind: 'chat', content: 'via bearer token' });
-        // Give the server a beat to fan out; unscoped clients must receive nothing.
-        setTimeout(() => {
-          ws.close();
-          resolve();
-        }, 50);
+      const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws`, { headers: { Cookie: bobCookie } });
+      ws.on('open', () => {
+        void (async () => {
+          const aliceInbox = `inbox:${encodeUserSuffix('web:basic:alice')}`;
+          await adapter.deliver(aliceInbox, null, { kind: 'chat', content: 'for alice only' });
+          // Give the server a beat to fan out; bob must receive nothing from alice's inbox.
+          setTimeout(() => {
+            ws.close();
+            resolve();
+          }, 50);
+        })();
       });
       ws.on('message', (data) => {
         events.push(JSON.parse(String(data)));
@@ -4127,9 +3941,7 @@ describe('web channel adapter', () => {
       { Cookie: cookie },
     );
     expect(action.status).toBe(200);
-    expect(actionCaptures).toEqual([
-      { questionId: 'approval-public', value: 'approve', userId: 'web:basic:alice' },
-    ]);
+    expect(actionCaptures).toEqual([{ questionId: 'approval-public', value: 'approve', userId: 'web:basic:alice' }]);
   });
 
   it('creates threads with session cookie in public mode', async () => {
@@ -4147,6 +3959,203 @@ describe('web channel adapter', () => {
     expect(created.body).toMatchObject({ title: 'Public topic' });
   });
 
+  it('only the creator or an owner can delete a lobby thread in public mode', async () => {
+    adapter = createWebAdapter(publicAdapterOptions(testPort));
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+    vi.mocked(isOwner).mockImplementation(async () => false);
+
+    const alice = await loginBasicSession('alice');
+    const bob = await loginBasicSession('bob');
+    const created = await httpPostJsonWithHeaders('/api/rooms/lobby/threads', { title: 'Mine' }, { Cookie: alice });
+    const threadId = (created.body as { id: string }).id;
+
+    const byBob = await httpDeleteWithHeaders(`/api/rooms/lobby/threads/${encodeURIComponent(threadId)}`, {
+      Cookie: bob,
+    });
+    expect(byBob.status).toBe(403);
+    expect(webchatStore.listThreads('lobby').some((t) => t.id === threadId)).toBe(true);
+
+    const byAlice = await httpDeleteWithHeaders(`/api/rooms/lobby/threads/${encodeURIComponent(threadId)}`, {
+      Cookie: alice,
+    });
+    expect(byAlice.status).toBe(200);
+
+    // Owners keep the ability to delete anyone's thread (the operator case).
+    const again = await httpPostJsonWithHeaders('/api/rooms/lobby/threads', { title: 'Mine 2' }, { Cookie: alice });
+    const threadId2 = (again.body as { id: string }).id;
+    vi.mocked(isOwner).mockImplementation(async (userId: string) => userId === 'web:basic:bob');
+    const byOwner = await httpDeleteWithHeaders(`/api/rooms/lobby/threads/${encodeURIComponent(threadId2)}`, {
+      Cookie: bob,
+    });
+    expect(byOwner.status).toBe(200);
+  });
+
+  it('gates attachment downloads by room access in public mode', async () => {
+    adapter = createWebAdapter(publicAdapterOptions(testPort));
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+
+    const alice = await loginBasicSession('alice');
+    const bob = await loginBasicSession('bob');
+    const posted = await httpPostJsonWithHeaders(
+      '/api/rooms/inbox/threads/main/messages',
+      {
+        text: 'private',
+        attachments: [{ name: 'secret.png', mimeType: 'image/png', type: 'image', data: PNG_BASE64 }],
+      },
+      { Cookie: alice },
+    );
+    expect(posted.status).toBe(200);
+    const url = (posted.body as { attachments: Array<{ url: string }> }).attachments[0]!.url;
+    expect(url).toContain('/api/attachments/');
+
+    const asBob = await httpGetWithHeaders(url, { Cookie: bob });
+    expect(asBob.status).toBe(403);
+    const anonymous = await httpGetWithHeaders(url, {});
+    expect(anonymous.status).toBe(401);
+    const asAlice = await httpGetWithHeaders(url, { Cookie: alice });
+    expect(asAlice.status).toBe(200);
+    expect(asAlice.headers['content-disposition']).toMatch(/^attachment; filename="secret\.png"/);
+
+    // Lobby attachments are shared: bob can fetch what alice posted there.
+    const lobbyPost = await httpPostJsonWithHeaders(
+      '/api/rooms/lobby/threads/main/messages',
+      { text: 'shared', attachments: [{ name: 'shared.png', mimeType: 'image/png', type: 'image', data: PNG_BASE64 }] },
+      { Cookie: alice },
+    );
+    const lobbyUrl = (lobbyPost.body as { attachments: Array<{ url: string }> }).attachments[0]!.url;
+    expect((await httpGetWithHeaders(lobbyUrl, { Cookie: bob })).status).toBe(200);
+  });
+
+  it('serves the MCP consent page and issues a code only on a CSRF-checked POST', async () => {
+    adapter = createWebAdapter(publicAdapterOptions(testPort));
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+
+    const opts = publicAdapterOptions(testPort);
+    const resourceServerUrl = new URL('/mcp', `${opts.publicBaseUrl}/`).href;
+    const backend = createWebchatMcpOAuthBackend({
+      publicAuth: opts.publicAuth!,
+      publicBaseUrl: opts.publicBaseUrl!,
+      resourceServerUrl,
+    });
+    const client = await backend.registerClient({
+      redirect_uris: ['http://127.0.0.1:8765/callback'],
+      token_endpoint_auth_method: 'none',
+      client_name: 'Claude Desktop',
+    });
+    const cookie = await loginBasicSession('alice');
+    const codeVerifier = 'consent-verifier';
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+    const redirect = backend.authorize(
+      { originalUrl: '/authorize', headers: { cookie } } as unknown as import('node:http').IncomingMessage,
+      client,
+      {
+        scopes: [MCP_DEFAULT_SCOPE],
+        codeChallenge,
+        redirectUri: 'http://127.0.0.1:8765/callback',
+        resource: resourceServerUrl,
+        state: 's1',
+      },
+    );
+    expect(redirect.location).toMatch(new RegExp(`^${MCP_CONSENT_PATH}\\?id=`));
+
+    // Anonymous: bounced to login with returnTo.
+    const anon = await httpGetWithHeaders(redirect.location, {});
+    expect(anon.status).toBe(302);
+    expect(String(anon.headers.location)).toMatch(/^\/\?returnTo=/);
+
+    // Logged in: consent page with client name, redirect URI, scopes and CSRF token.
+    const page = await httpGetWithHeaders(redirect.location, { Cookie: cookie });
+    expect(page.status).toBe(200);
+    expect(page.headers['content-type']).toContain('text/html');
+    const body = String(page.body);
+    expect(body).toContain('Claude Desktop');
+    expect(body).toContain('http://127.0.0.1:8765/callback');
+    expect(body).toContain(MCP_DEFAULT_SCOPE);
+    const consentId = /name="id" value="([^"]+)"/.exec(body)![1]!;
+    const csrf = /name="csrf" value="([^"]+)"/.exec(body)![1]!;
+
+    const postForm = (form: Record<string, string>, headers: Record<string, string>) =>
+      new Promise<{ status: number; location?: string }>((resolve, reject) => {
+        const payload = new URLSearchParams(form).toString();
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: testPort,
+            path: MCP_CONSENT_PATH,
+            method: 'POST',
+            agent: false,
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Content-Length': Buffer.byteLength(payload),
+              Connection: 'close',
+              ...headers,
+            },
+          },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, location: res.headers.location }));
+          },
+        );
+        req.on('error', reject);
+        req.end(payload);
+      });
+
+    // Wrong CSRF / no session: no code.
+    expect((await postForm({ id: consentId, csrf: 'nope', action: 'approve' }, { Cookie: cookie })).status).toBe(403);
+    expect((await postForm({ id: consentId, csrf, action: 'approve' }, {})).status).toBe(401);
+    const bobCookie = await loginBasicSession('bob');
+    expect((await postForm({ id: consentId, csrf, action: 'approve' }, { Cookie: bobCookie })).status).toBe(400);
+
+    // Valid POST from the owning session: code issued, state echoed.
+    const approved = await postForm({ id: consentId, csrf, action: 'approve' }, { Cookie: cookie });
+    expect(approved.status).toBe(302);
+    const target = new URL(approved.location!);
+    expect(target.origin + target.pathname).toBe('http://127.0.0.1:8765/callback');
+    expect(target.searchParams.get('state')).toBe('s1');
+    const code = target.searchParams.get('code')!;
+    const tokens = await backend.exchangeAuthorizationCode(client, code, resourceServerUrl, {
+      codeVerifier,
+      redirectUri: 'http://127.0.0.1:8765/callback',
+    });
+    expect(
+      verifyMcpAccessToken(tokens.access_token, {
+        publicAuth: opts.publicAuth!,
+        resourceServerUrl,
+        publicBaseUrl: opts.publicBaseUrl,
+      }),
+    ).toMatchObject({
+      userId: 'web:basic:alice',
+    });
+
+    // Consent is single-use.
+    expect((await postForm({ id: consentId, csrf, action: 'approve' }, { Cookie: cookie })).status).toBe(400);
+  });
+
+  it('returns 403 for OAuth dynamic client registration unless explicitly allowed', async () => {
+    adapter = createWebAdapter({ ...publicAdapterOptions(testPort), mcpHttpEnabled: true });
+    resetWebchatAuthSchemaForTests();
+    await adapter.setup(setup);
+    const denied = await httpPostJsonNoAuth('/register', { redirect_uris: ['http://127.0.0.1:1/cb'] });
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ error: 'access_denied' });
+    // Other MCP router paths still reach the delegate (mocked to 204).
+    expect((await httpGetWithHeaders('/.well-known/oauth-authorization-server', {})).status).toBe(204);
+    await adapter.teardown();
+
+    testPort = await reservePort();
+    adapter = createWebAdapter({
+      ...publicAdapterOptions(testPort),
+      mcpHttpEnabled: true,
+      mcpAllowDynamicClientRegistration: true,
+    });
+    await adapter.setup(setup);
+    const allowed = await httpPostJsonNoAuth('/register', { redirect_uris: ['http://127.0.0.1:1/cb'] });
+    expect(allowed.status).toBe(204);
+  });
+
   async function mintMcpAccessToken(username: string): Promise<string> {
     const opts = publicAdapterOptions(testPort);
     const resourceServerUrl = new URL('/mcp', `${opts.publicBaseUrl}/`).href;
@@ -4155,9 +4164,10 @@ describe('web channel adapter', () => {
       publicBaseUrl: opts.publicBaseUrl!,
       resourceServerUrl,
     });
-    const client = await backend.clientsStore.registerClient({
+    const client = await backend.registerClient({
       redirect_uris: ['http://127.0.0.1:8765/callback'],
       token_endpoint_auth_method: 'none',
+      client_name: 'Test MCP client',
     });
     const session = createSession(
       {
@@ -4168,22 +4178,24 @@ describe('web channel adapter', () => {
       3600,
     );
     const cookie = signSessionCookie(session.id, PUBLIC_SESSION_SECRET);
+    const sessionReq = {
+      originalUrl: '/authorize',
+      headers: { cookie: `${WEBCHAT_SESSION_COOKIE}=${encodeURIComponent(cookie)}` },
+    } as unknown as import('node:http').IncomingMessage;
     const codeVerifier = 'test-verifier';
     const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
-    const redirect = backend.authorize(
-      {
-        originalUrl: '/authorize',
-        headers: { cookie: `${WEBCHAT_SESSION_COOKIE}=${encodeURIComponent(cookie)}` },
-      } as unknown as import('node:http').IncomingMessage,
-      client,
-      {
-        scopes: [MCP_DEFAULT_SCOPE],
-        codeChallenge,
-        redirectUri: 'http://127.0.0.1:8765/callback',
-        resource: resourceServerUrl,
-      },
-    );
-    const code = new URL(redirect.location).searchParams.get('code')!;
+    const redirect = backend.authorize(sessionReq, client, {
+      scopes: [MCP_DEFAULT_SCOPE],
+      codeChallenge,
+      redirectUri: 'http://127.0.0.1:8765/callback',
+      resource: resourceServerUrl,
+    });
+    // authorize() never hands out a code: it parks a consent and sends the browser to the consent page.
+    const consentId = new URL(redirect.location, opts.publicBaseUrl).searchParams.get('id')!;
+    const consent = backend.getPendingConsent(sessionReq, consentId)!;
+    const decision = backend.decideConsent(sessionReq, consentId, consent.csrfToken, true);
+    if (decision.type !== 'redirect') throw new Error(decision.message);
+    const code = new URL(decision.location).searchParams.get('code')!;
     const tokens = await backend.exchangeAuthorizationCode(client, code, resourceServerUrl, {
       codeVerifier,
       redirectUri: 'http://127.0.0.1:8765/callback',
@@ -4226,10 +4238,9 @@ describe('web channel adapter', () => {
 
     const token = await mintMcpAccessToken('alice');
     const bobInbox = `inbox:${encodeUserSuffix('web:basic:bob')}`;
-    const res = await httpGetWithHeaders(
-      `/api/rooms/${encodeURIComponent(bobInbox)}/threads/main/messages`,
-      { Authorization: `Bearer ${token}` },
-    );
+    const res = await httpGetWithHeaders(`/api/rooms/${encodeURIComponent(bobInbox)}/threads/main/messages`, {
+      Authorization: `Bearer ${token}`,
+    });
     expect(res.status).toBe(403);
   });
 
@@ -4265,7 +4276,9 @@ describe('web channel adapter', () => {
     const boundary = '----WebKitFormBoundaryMcpForbidden';
     const content = Buffer.from('hello');
     const body = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="x.txt"\r\nContent-Type: text/plain\r\n\r\n`),
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="x.txt"\r\nContent-Type: text/plain\r\n\r\n`,
+      ),
       content,
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]);
@@ -4345,10 +4358,9 @@ describe('web channel adapter', () => {
 
     const token = await mintMcpAccessToken('alice');
     const bobInbox = `inbox:${encodeUserSuffix('web:basic:bob')}`;
-    const res = await httpDeleteWithHeaders(
-      `/api/rooms/${encodeURIComponent(bobInbox)}/threads/main`,
-      { Authorization: `Bearer ${token}` },
-    );
+    const res = await httpDeleteWithHeaders(`/api/rooms/${encodeURIComponent(bobInbox)}/threads/main`, {
+      Authorization: `Bearer ${token}`,
+    });
     expect(res.status).toBe(403);
   });
 
@@ -4567,7 +4579,7 @@ describe('web channel adapter', () => {
   });
 
   it('POST actions invokes onAction only once for concurrent mirrored clicks', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-once',
       session_id: 'sess-sarah',
     } as never);
@@ -4722,7 +4734,7 @@ describe('web channel adapter', () => {
   });
 
   it('omits senderName when agent group cannot be resolved for approval cards', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-no-agent',
       session_id: 'sess-sarah',
     } as never);
@@ -4737,7 +4749,7 @@ describe('web channel adapter', () => {
       channel_type: 'web',
       platform_id: 'dm:sarah',
     } as never);
-    getAgentGroupMock.mockReturnValueOnce(undefined);
+    getAgentGroupMock.mockResolvedValueOnce(undefined);
 
     await adapter.setup(setup);
     await adapter.deliver('inbox', null, {
@@ -4757,7 +4769,7 @@ describe('web channel adapter', () => {
   });
 
   it('resolves senderName from pending approval session agent when omitted', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-agent-name',
       session_id: 'sess-sarah',
     } as never);
@@ -4814,7 +4826,7 @@ describe('web channel adapter', () => {
   });
 
   it('does not mirror inbox approval cards when session origin is not web', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-telegram',
       session_id: 'sess-telegram',
     } as never);
@@ -4849,7 +4861,7 @@ describe('web channel adapter', () => {
   });
 
   it('does not mirror when pending approval has no session', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-no-session',
     } as never);
 
@@ -4870,7 +4882,7 @@ describe('web channel adapter', () => {
   });
 
   it('does not mirror when session has no messaging group', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-no-mg',
       session_id: 'sess-no-mg',
     } as never);
@@ -4919,7 +4931,7 @@ describe('web channel adapter', () => {
   });
 
   it('mirrors inbox approval cards to the session origin web room', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-mirror',
       session_id: 'sess-sarah',
     } as never);
@@ -4950,17 +4962,18 @@ describe('web channel adapter', () => {
     const inbox = await httpGet('/api/rooms/inbox/threads/main/messages');
     const dm = await httpGet('/api/rooms/dm%3Asarah/threads/main/messages');
     expect((inbox.body as { messages: unknown[] }).messages).toHaveLength(1);
-    expect((dm.body as { messages: Array<{ card?: { questionId: string }; senderName?: string }> }).messages).toHaveLength(1);
     expect(
-      (dm.body as { messages: Array<{ card?: { questionId: string }; senderName?: string }> }).messages[0]?.card?.questionId,
+      (dm.body as { messages: Array<{ card?: { questionId: string }; senderName?: string }> }).messages,
+    ).toHaveLength(1);
+    expect(
+      (dm.body as { messages: Array<{ card?: { questionId: string }; senderName?: string }> }).messages[0]?.card
+        ?.questionId,
     ).toBe('approval-mirror');
-    expect(
-      (dm.body as { messages: Array<{ senderName?: string }> }).messages[0]?.senderName,
-    ).toBe('Sarah');
+    expect((dm.body as { messages: Array<{ senderName?: string }> }).messages[0]?.senderName).toBe('Sarah');
   });
 
   it('updates mirrored approval cards together when an action is taken', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-sync',
       session_id: 'sess-sarah',
     } as never);
@@ -4991,12 +5004,14 @@ describe('web channel adapter', () => {
     const events: unknown[] = [];
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${testPort}/api/ws?token=${SECRET}`);
-      ws.on('open', async () => {
-        const status = await httpPost('/api/rooms/dm%3Asarah/threads/main/actions', {
-          questionId: 'approval-sync',
-          value: 'approve',
-        });
-        expect(status).toBe(200);
+      ws.on('open', () => {
+        void (async () => {
+          const status = await httpPost('/api/rooms/dm%3Asarah/threads/main/actions', {
+            questionId: 'approval-sync',
+            value: 'approve',
+          });
+          expect(status).toBe(200);
+        })();
       });
       ws.on('message', (data) => {
         events.push(JSON.parse(data.toString()));
@@ -5013,10 +5028,16 @@ describe('web channel adapter', () => {
     expect(updates).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          message: expect.objectContaining({ platformId: 'inbox', card: expect.objectContaining({ status: 'answered' }) }),
+          message: expect.objectContaining({
+            platformId: 'inbox',
+            card: expect.objectContaining({ status: 'answered' }),
+          }),
         }),
         expect.objectContaining({
-          message: expect.objectContaining({ platformId: 'dm:sarah', card: expect.objectContaining({ status: 'answered' }) }),
+          message: expect.objectContaining({
+            platformId: 'dm:sarah',
+            card: expect.objectContaining({ status: 'answered' }),
+          }),
         }),
       ]),
     );
@@ -5049,7 +5070,7 @@ describe('web channel adapter', () => {
   });
 
   it('POST actions returns 403 when actor is not the named approver', async () => {
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-forbid',
       session_id: 'sess-sarah',
       approver_user_id: 'web:github:999',
@@ -5077,37 +5098,37 @@ describe('web channel adapter', () => {
     expect(actionCaptures).toHaveLength(0);
   });
 
-  it('isAuthorizedApprovalActor allows non-approval cards and exact approver', () => {
-    getPendingApprovalMock.mockReturnValue(undefined);
-    expect(isAuthorizedApprovalActor('web:github:1', 'missing')).toBe(true);
+  it('isAuthorizedApprovalActor allows non-approval cards and exact approver', async () => {
+    getPendingApprovalMock.mockResolvedValue(undefined);
+    expect(await isAuthorizedApprovalActor('web:github:1', 'missing')).toBe(true);
 
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'a1',
       approver_user_id: 'web:github:1',
     } as never);
-    expect(isAuthorizedApprovalActor('web:github:1', 'a1')).toBe(true);
-    expect(isAuthorizedApprovalActor('web:github:2', 'a1')).toBe(false);
+    expect(await isAuthorizedApprovalActor('web:github:1', 'a1')).toBe(true);
+    expect(await isAuthorizedApprovalActor('web:github:2', 'a1')).toBe(false);
   });
 
-  it('isAuthorizedApprovalActor uses admin privilege when approver is unset', () => {
+  it('isAuthorizedApprovalActor uses admin privilege when approver is unset', async () => {
     const isOwnerMock = vi.mocked(isOwner);
     const hasAdminMock = vi.mocked(hasAdminPrivilege);
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'a2',
       agent_group_id: 'ag-1',
       approver_user_id: null,
     } as never);
-    hasAdminMock.mockReturnValueOnce(false);
-    expect(isAuthorizedApprovalActor('web:github:1', 'a2')).toBe(false);
-    hasAdminMock.mockReturnValueOnce(true);
-    expect(isAuthorizedApprovalActor('web:github:1', 'a2')).toBe(true);
-    isOwnerMock.mockReturnValue(true);
+    hasAdminMock.mockResolvedValueOnce(false);
+    expect(await isAuthorizedApprovalActor('web:github:1', 'a2')).toBe(false);
+    hasAdminMock.mockResolvedValueOnce(true);
+    expect(await isAuthorizedApprovalActor('web:github:1', 'a2')).toBe(true);
+    isOwnerMock.mockResolvedValue(true);
   });
 
   it('does not mirror approval cards in public mode when origin owner mismatches approver', async () => {
     adapter = createWebAdapter(publicAdapterOptions(testPort));
     resetWebchatAuthSchemaForTests();
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-public-mirror',
       session_id: 'sess-sarah',
       approver_user_id: 'web:local',
@@ -5138,16 +5159,8 @@ describe('web channel adapter', () => {
     });
 
     const cookie = await loginBasicSession('alice');
-    const inbox = await httpGetWithHeaders(
-      '/api/rooms/inbox/threads/main/messages',
-      { Cookie: cookie },
-      testPort,
-    );
-    const dm = await httpGetWithHeaders(
-      '/api/rooms/dm%3Asarah/threads/main/messages',
-      { Cookie: cookie },
-      testPort,
-    );
+    const inbox = await httpGetWithHeaders('/api/rooms/inbox/threads/main/messages', { Cookie: cookie }, testPort);
+    const dm = await httpGetWithHeaders('/api/rooms/dm%3Asarah/threads/main/messages', { Cookie: cookie }, testPort);
     expect((inbox.body as { messages: unknown[] }).messages).toHaveLength(1);
     expect((dm.body as { messages: unknown[] }).messages).toHaveLength(0);
   });
@@ -5156,7 +5169,7 @@ describe('web channel adapter', () => {
     adapter = createWebAdapter(publicAdapterOptions(testPort));
     resetWebchatAuthSchemaForTests();
     const alice = 'web:basic:alice';
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-public-ok',
       session_id: 'sess-sarah',
       approver_user_id: alice,
@@ -5186,11 +5199,7 @@ describe('web channel adapter', () => {
     });
 
     const cookie = await loginBasicSession('alice');
-    const dm = await httpGetWithHeaders(
-      '/api/rooms/dm%3Asarah/threads/main/messages',
-      { Cookie: cookie },
-      testPort,
-    );
+    const dm = await httpGetWithHeaders('/api/rooms/dm%3Asarah/threads/main/messages', { Cookie: cookie }, testPort);
     expect((dm.body as { messages: unknown[] }).messages).toHaveLength(1);
   });
 
@@ -5198,7 +5207,7 @@ describe('web channel adapter', () => {
     adapter = createWebAdapter(publicAdapterOptions(testPort));
     resetWebchatAuthSchemaForTests();
     const alice = 'web:basic:alice';
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'approval-public-null-approver',
       session_id: 'sess-sarah',
       approver_user_id: null,
@@ -5214,7 +5223,7 @@ describe('web channel adapter', () => {
       channel_type: 'web',
       platform_id: `dm:sarah:${encodeUserSuffix(alice)}`,
     } as never);
-    vi.mocked(isOwner).mockReturnValue(true);
+    vi.mocked(isOwner).mockResolvedValue(true);
 
     await adapter.setup(setup);
     await adapter.deliver(`inbox:${encodeUserSuffix(alice)}`, null, {
@@ -5229,11 +5238,7 @@ describe('web channel adapter', () => {
     });
 
     const cookie = await loginBasicSession('alice');
-    const dm = await httpGetWithHeaders(
-      '/api/rooms/dm%3Asarah/threads/main/messages',
-      { Cookie: cookie },
-      testPort,
-    );
+    const dm = await httpGetWithHeaders('/api/rooms/dm%3Asarah/threads/main/messages', { Cookie: cookie }, testPort);
     expect((dm.body as { messages: unknown[] }).messages).toHaveLength(1);
   });
 
@@ -5310,9 +5315,9 @@ describe('web channel adapter', () => {
     expect(boot.forUserId).toBe('web:basic:alice');
   });
 
-  it('shouldMirrorApprovalToOrigin rejects when origin matches delivery platform', () => {
+  it('shouldMirrorApprovalToOrigin rejects when origin matches delivery platform', async () => {
     expect(
-      shouldMirrorApprovalToOrigin(
+      await shouldMirrorApprovalToOrigin(
         { platformId: 'inbox:web~basic~alice', threadId: 'main' },
         'q',
         'inbox:web~basic~alice',
@@ -5321,17 +5326,17 @@ describe('web channel adapter', () => {
     ).toBe(false);
   });
 
-  it('shouldMirrorApprovalToOrigin covers inbox, local, and lookup guards', () => {
-    expect(
-      shouldMirrorApprovalToOrigin({ platformId: 'inbox', threadId: 'main' }, 'q', 'inbox:x', true),
-    ).toBe(false);
-    expect(
-      shouldMirrorApprovalToOrigin({ platformId: 'dm:sarah', threadId: 'main' }, 'q', 'inbox', false),
-    ).toBe(true);
+  it('shouldMirrorApprovalToOrigin covers inbox, local, and lookup guards', async () => {
+    expect(await shouldMirrorApprovalToOrigin({ platformId: 'inbox', threadId: 'main' }, 'q', 'inbox:x', true)).toBe(
+      false,
+    );
+    expect(await shouldMirrorApprovalToOrigin({ platformId: 'dm:sarah', threadId: 'main' }, 'q', 'inbox', false)).toBe(
+      true,
+    );
 
-    hasTableMock.mockReturnValueOnce(false);
+    hasTableMock.mockResolvedValueOnce(false);
     expect(
-      shouldMirrorApprovalToOrigin(
+      await shouldMirrorApprovalToOrigin(
         { platformId: `dm:sarah:${encodeUserSuffix('web:basic:alice')}`, threadId: 'main' },
         'q',
         'inbox:x',
@@ -5339,10 +5344,10 @@ describe('web channel adapter', () => {
       ),
     ).toBe(false);
 
-    getPendingApprovalMock.mockReturnValueOnce(undefined);
+    getPendingApprovalMock.mockResolvedValueOnce(undefined);
     // Default isOwner mock is true — null approver still mirrors into an owned room.
     expect(
-      shouldMirrorApprovalToOrigin(
+      await shouldMirrorApprovalToOrigin(
         { platformId: `dm:sarah:${encodeUserSuffix('web:basic:alice')}`, threadId: 'main' },
         'q',
         'inbox:x',
@@ -5350,11 +5355,11 @@ describe('web channel adapter', () => {
       ),
     ).toBe(true);
 
-    vi.mocked(isOwner).mockReturnValueOnce(false);
-    vi.mocked(isGlobalAdmin).mockReturnValueOnce(false);
-    getPendingApprovalMock.mockReturnValueOnce({ approval_id: 'q' } as never);
+    vi.mocked(isOwner).mockResolvedValueOnce(false);
+    vi.mocked(isGlobalAdmin).mockResolvedValueOnce(false);
+    getPendingApprovalMock.mockResolvedValueOnce({ approval_id: 'q' } as never);
     expect(
-      shouldMirrorApprovalToOrigin(
+      await shouldMirrorApprovalToOrigin(
         { platformId: `dm:sarah:${encodeUserSuffix('web:basic:alice')}`, threadId: 'main' },
         'q',
         'inbox:x',
@@ -5362,18 +5367,18 @@ describe('web channel adapter', () => {
       ),
     ).toBe(false);
 
-    getPendingApprovalMock.mockReturnValueOnce({
+    getPendingApprovalMock.mockResolvedValueOnce({
       approver_user_id: 'web:basic:alice',
     } as never);
-    expect(
-      shouldMirrorApprovalToOrigin({ platformId: 'lobby', threadId: 'main' }, 'q', 'inbox:x', true),
-    ).toBe(false);
+    expect(await shouldMirrorApprovalToOrigin({ platformId: 'lobby', threadId: 'main' }, 'q', 'inbox:x', true)).toBe(
+      false,
+    );
 
     getPendingApprovalMock.mockImplementationOnce(() => {
       throw new Error('mirror lookup failed');
     });
     expect(
-      shouldMirrorApprovalToOrigin(
+      await shouldMirrorApprovalToOrigin(
         { platformId: `dm:sarah:${encodeUserSuffix('web:basic:alice')}`, threadId: 'main' },
         'q',
         'inbox:x',
@@ -5382,30 +5387,30 @@ describe('web channel adapter', () => {
     ).toBe(false);
   });
 
-  it('isAuthorizedApprovalActor allows when pending_approvals table is missing', () => {
-    hasTableMock.mockReturnValueOnce(false);
-    expect(isAuthorizedApprovalActor('web:anyone', 'q')).toBe(true);
+  it('isAuthorizedApprovalActor allows when pending_approvals table is missing', async () => {
+    hasTableMock.mockResolvedValueOnce(false);
+    expect(await isAuthorizedApprovalActor('web:anyone', 'q')).toBe(true);
   });
 
-  it('isAuthorizedApprovalActor fails closed when lookup throws', () => {
+  it('isAuthorizedApprovalActor fails closed when lookup throws', async () => {
     getPendingApprovalMock.mockImplementation(() => {
       throw new Error('db down');
     });
-    expect(isAuthorizedApprovalActor('web:local', 'q')).toBe(false);
+    expect(await isAuthorizedApprovalActor('web:local', 'q')).toBe(false);
   });
 
-  it('isAuthorizedApprovalActor uses owner check when agent group is unset', () => {
+  it('isAuthorizedApprovalActor uses owner check when agent group is unset', async () => {
     const isOwnerMock = vi.mocked(isOwner);
     const isGlobalAdminMock = vi.mocked(isGlobalAdmin);
-    getPendingApprovalMock.mockReturnValue({
+    getPendingApprovalMock.mockResolvedValue({
       approval_id: 'a3',
       agent_group_id: null,
       session_id: null,
       approver_user_id: null,
     } as never);
-    isOwnerMock.mockReturnValueOnce(false);
-    isGlobalAdminMock.mockReturnValueOnce(true);
-    expect(isAuthorizedApprovalActor('web:github:1', 'a3')).toBe(true);
+    isOwnerMock.mockResolvedValueOnce(false);
+    isGlobalAdminMock.mockResolvedValueOnce(true);
+    expect(await isAuthorizedApprovalActor('web:github:1', 'a3')).toBe(true);
   });
 
   it('skips public mirror when approval lookup throws', async () => {
@@ -5445,11 +5450,7 @@ describe('web channel adapter', () => {
     });
 
     const cookie = await loginBasicSession('alice');
-    const dm = await httpGetWithHeaders(
-      '/api/rooms/dm%3Asarah/threads/main/messages',
-      { Cookie: cookie },
-      testPort,
-    );
+    const dm = await httpGetWithHeaders('/api/rooms/dm%3Asarah/threads/main/messages', { Cookie: cookie }, testPort);
     expect((dm.body as { messages: unknown[] }).messages).toHaveLength(0);
   });
 });

@@ -28,7 +28,6 @@
     "release-notes": "node scripts/release-notes.mjs",
     "chat": "tsx scripts/chat.ts",
     "latency": "tsx scripts/latency-check.ts",
-    "auth": "tsx src/whatsapp-auth.ts",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
