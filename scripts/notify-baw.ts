@@ -3,8 +3,12 @@
  * reads it and (typically) relays it to the operator.
  *
  * Replaces the per-event notify-baw-*.ts one-offs. The target session is resolved
- * from the central DB (most recently active session of the agent group), so no
- * ids are hardcoded here.
+ * from the central DB: the group's most recently active CHAT session (one bound
+ * to a messaging group), so no ids are hardcoded here. Chat sessions are
+ * preferred over task sessions because scheduled tasks fire every few minutes
+ * and would otherwise always be "most recent" — on 2026-09-28 the first use of
+ * this script landed a deploy report in the refinery-bot-watchdog task session,
+ * whose container consumed it inside a task run instead of the operator's chat.
  *
  * Usage:
  *   pnpm exec tsx scripts/notify-baw.ts --text "message"
@@ -69,7 +73,7 @@ function resolveTarget(): Target {
       : (central
           .prepare(
             `${base} WHERE ag.folder = ? AND s.status = 'active'
-             ORDER BY s.last_active DESC, s.created_at DESC LIMIT 1`,
+             ORDER BY (s.messaging_group_id IS NOT NULL) DESC, s.last_active DESC, s.created_at DESC LIMIT 1`,
           )
           .get(folder) as Target | undefined);
     if (!row) {
