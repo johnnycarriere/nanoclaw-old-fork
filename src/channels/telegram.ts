@@ -249,11 +249,11 @@ export function createTelegramInboundInterceptor(
 
     try {
       if (!botUsername) {
-        hostOnInbound(platformId, threadId, message);
+        void hostOnInbound(platformId, threadId, message);
         return;
       }
       if (!text) {
-        hostOnInbound(platformId, threadId, message);
+        void hostOnInbound(platformId, threadId, message);
         return;
       }
       const consumed = await tryConsume({
@@ -265,7 +265,7 @@ export function createTelegramInboundInterceptor(
         instance: instanceKey,
       });
       if (!consumed) {
-        hostOnInbound(platformId, threadId, message);
+        void hostOnInbound(platformId, threadId, message);
         return;
       }
       // Pairing matched — record the chat and short-circuit so the
@@ -325,7 +325,7 @@ export function createTelegramInboundInterceptor(
     } catch (err) {
       log.error('Telegram pairing interceptor error', { err });
       // Fail open: pass through so a pairing bug doesn't break normal traffic.
-      hostOnInbound(platformId, threadId, message);
+      void hostOnInbound(platformId, threadId, message);
     }
   };
 }

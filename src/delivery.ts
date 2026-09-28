@@ -33,6 +33,33 @@ import type { OutboundMessage } from './mailbox/index.js';
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
+/** Rate-limit responses that carry no retry-after hint back off this long. */
+const DEFAULT_RATE_LIMIT_MS = 5_000;
+
+/**
+ * Per-message "not before" set by a platform rate limit. A 429 is not a
+ * failed attempt — the platform told us exactly when to try again — so it
+ * must not burn one of MAX_DELIVERY_ATTEMPTS. In-memory on purpose: the
+ * deferral is seconds long and the attempts row would need a second write
+ * path to hold it without incrementing the count.
+ */
+const deferredUntil = new Map<string, number>();
+
+/**
+ * Milliseconds to wait when `err` is a platform rate-limit error, else null.
+ * @chat-adapter's AdapterRateLimitError carries `retryAfter` in seconds; the
+ * chat core's RateLimitError carries `retryAfterMs`.
+ */
+export function rateLimitRetryAfterMs(err: unknown): number | null {
+  if (!err || typeof err !== 'object') return null;
+  const e = err as { retryAfter?: unknown; retryAfterMs?: unknown; code?: unknown; name?: unknown };
+  if (typeof e.retryAfterMs === 'number' && e.retryAfterMs >= 0) return e.retryAfterMs;
+  if (typeof e.retryAfter === 'number' && e.retryAfter >= 0) return e.retryAfter * 1000;
+  if (e.code === 'RATE_LIMITED' || e.name === 'AdapterRateLimitError' || e.name === 'RateLimitError') {
+    return DEFAULT_RATE_LIMIT_MS;
+  }
+  return null;
+}
 
 /**
  * Attempt counts live in the `delivery_attempts` table, so they survive a
@@ -254,6 +281,13 @@ async function drainSession(session: Session): Promise<void> {
   }
 
   for (const msg of pending) {
+    // A rate-limited row pauses the whole queue for this session (not just
+    // the row) so later messages can't overtake it.
+    const notBefore = deferredUntil.get(msg.id);
+    if (notBefore !== undefined) {
+      if (notBefore > Date.now()) break;
+      deferredUntil.delete(msg.id);
+    }
     try {
       const platformMsgId = await deliverMessage(msg, session);
       await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) =>
@@ -286,6 +320,16 @@ async function drainSession(session: Session): Promise<void> {
         }
       }
     } catch (err) {
+      const retryAfterMs = rateLimitRetryAfterMs(err);
+      if (retryAfterMs !== null) {
+        deferredUntil.set(msg.id, Date.now() + retryAfterMs);
+        log.warn('Message delivery rate limited, deferring without counting an attempt', {
+          messageId: msg.id,
+          sessionId: session.id,
+          retryAfterMs,
+        });
+        break;
+      }
       const attempts = await recordAttemptRow(msg.id, session.id, err);
       if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
         log.error('Message delivery failed permanently, giving up', {

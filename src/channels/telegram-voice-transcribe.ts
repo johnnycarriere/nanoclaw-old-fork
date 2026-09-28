@@ -16,6 +16,10 @@ import { log } from '../log.js';
 
 const GROQ_TRANSCRIPTION_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
 const GROQ_MODEL = 'whisper-large-v3-turbo';
+/** Per-request cap so a stalled Groq call can't hold inbound routing hostage. */
+export const TRANSCRIBE_TIMEOUT_MS = 30_000;
+/** Largest audio payload we send for transcription (Telegram voice notes are far smaller). */
+export const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 
 function groqKey(): string {
   return process.env.GROQ_API_KEY || readEnvFile(['GROQ_API_KEY']).GROQ_API_KEY || '';
@@ -39,6 +43,7 @@ async function transcribe(audioBuffer: Buffer, mimeType: string): Promise<string
         method: 'POST',
         headers: { Authorization: `Bearer ${apiKey}` },
         body: form,
+        signal: AbortSignal.timeout(TRANSCRIBE_TIMEOUT_MS),
       });
 
       if (!res.ok) {
@@ -63,22 +68,31 @@ async function transcribe(audioBuffer: Buffer, mimeType: string): Promise<string
 interface Attachment {
   type?: string;
   mimeType?: string;
+  /** Set for `raw.audio` (music/audio files, from file_name); never set for `raw.voice` notes. */
+  name?: string;
   data?: string;
 }
 
 /**
  * If the inbound message is a pure voice note (no text + audio attachment),
  * transcribe it in place and rewrite content.text. No-ops for everything else.
+ * Music/audio files (the adapter maps both `raw.voice` and `raw.audio` to
+ * type 'audio', but only the latter carries a file name) are left untouched.
  */
 export async function maybeTranscribeVoice(content: Record<string, unknown>): Promise<void> {
   if (typeof content.text === 'string' && content.text.trim().length > 0) return;
   const attachments = content.attachments as Attachment[] | undefined;
   if (!attachments || attachments.length === 0) return;
-  const audio = attachments.find((a) => a.type === 'audio' && a.data);
+  const audio = attachments.find((a) => a.type === 'audio' && a.data && !a.name);
   if (!audio || !audio.data) return;
 
   try {
     const buffer = Buffer.from(audio.data, 'base64');
+    if (buffer.length > MAX_AUDIO_BYTES) {
+      log.warn('Telegram voice: attachment over size cap, skipping transcription', { bytes: buffer.length });
+      content.text = '[Voice message — too large to transcribe]';
+      return;
+    }
     const transcript = await transcribe(buffer, audio.mimeType ?? 'audio/ogg');
     if (transcript) {
       content.text = `[Voice message]: "${transcript}"`;
