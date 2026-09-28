@@ -1,58 +1,112 @@
 /**
- * notify-baw.ts — generic: inject a system notice into Baw's main Telegram session so
- * Baw reads it and (typically) relays to Johnny. Replaces the per-event one-off
- * notify-baw-*.ts scripts for simple cases.
+ * notify-baw.ts — inject a system notice into a live agent session so the agent
+ * reads it and (typically) relays it to the operator.
+ *
+ * Replaces the per-event notify-baw-*.ts one-offs. The target session is resolved
+ * from the central DB (most recently active session of the agent group), so no
+ * ids are hardcoded here.
  *
  * Usage:
  *   pnpm exec tsx scripts/notify-baw.ts --text "message"
  *   pnpm exec tsx scripts/notify-baw.ts --file path/to/message.md
  *   echo "message" | pnpm exec tsx scripts/notify-baw.ts
+ *   pnpm exec tsx scripts/notify-baw.ts --group <folder> --text "..."   # default: telegram_main
+ *   pnpm exec tsx scripts/notify-baw.ts --session <session-id> --text "..."
  *
- * Host is the inbound writer, so seq must be EVEN. The running container picks the
- * message up on its next poll (~1s); otherwise the 60s host sweep wakes the session.
+ * The write goes through the host's inbound helper (even seq, same record shape
+ * as the router). The running container picks it up on its next poll (~1s);
+ * otherwise the 60s host sweep wakes the session.
  */
 import Database from 'better-sqlite3';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const AGENT_GROUP = 'ag-1776954494931-vd24yu';
-const SESSION = 'sess-1776954507800-9inx0n';
-const PLATFORM_ID = 'telegram:1644976441';
-const CHANNEL = 'telegram';
+import { insertMessage, openInboundDb } from '../src/mailbox/sqlite/session-db.js';
+
+const ROOT = join(import.meta.dirname, '..');
+const CENTRAL_DB = join(ROOT, 'data', 'v2.db');
+
+function arg(name: string): string | undefined {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
+}
 
 function getText(): string {
-  const args = process.argv.slice(2);
-  const textIdx = args.indexOf('--text');
-  if (textIdx !== -1 && args[textIdx + 1]) return args[textIdx + 1];
-  const fileIdx = args.indexOf('--file');
-  if (fileIdx !== -1 && args[fileIdx + 1]) return readFileSync(args[fileIdx + 1], 'utf-8');
+  const text = arg('text');
+  if (text) return text;
+  const file = arg('file');
+  if (file) return readFileSync(file, 'utf-8');
   const stdin = readFileSync(0, 'utf-8');
   if (stdin.trim()) return stdin;
-  console.error('Usage: notify-baw.ts --text "msg" | --file msg.md | stdin');
+  console.error('Usage: notify-baw.ts [--group <folder> | --session <id>] (--text "msg" | --file msg.md | stdin)');
   process.exit(1);
 }
 
+interface Target {
+  session_id: string;
+  agent_group_id: string;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
+}
+
+function resolveTarget(): Target {
+  if (!existsSync(CENTRAL_DB)) {
+    console.error(`Central DB not found at ${CENTRAL_DB}`);
+    process.exit(1);
+  }
+  const central = new Database(CENTRAL_DB, { readonly: true });
+  try {
+    const sessionId = arg('session');
+    const folder = arg('group') ?? 'telegram_main';
+    const base = `SELECT s.id AS session_id, s.agent_group_id, s.thread_id,
+                         mg.platform_id, mg.channel_type
+                  FROM sessions s
+                  JOIN agent_groups ag ON ag.id = s.agent_group_id
+                  LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id`;
+    const row = sessionId
+      ? (central.prepare(`${base} WHERE s.id = ?`).get(sessionId) as Target | undefined)
+      : (central
+          .prepare(
+            `${base} WHERE ag.folder = ? AND s.status = 'active'
+             ORDER BY s.last_active DESC, s.created_at DESC LIMIT 1`,
+          )
+          .get(folder) as Target | undefined);
+    if (!row) {
+      console.error(sessionId ? `No session ${sessionId}` : `No active session for agent group folder "${folder}"`);
+      process.exit(1);
+    }
+    return row;
+  } finally {
+    central.close();
+  }
+}
+
 const text = getText().trim();
-const dbPath = join(import.meta.dirname, '..', 'data', 'v2-sessions', AGENT_GROUP, SESSION, 'inbound.db');
-const db = new Database(dbPath);
-db.pragma('busy_timeout = 5000');
+const target = resolveTarget();
+const dbPath = join(ROOT, 'data', 'v2-sessions', target.agent_group_id, target.session_id, 'inbound.db');
+if (!existsSync(dbPath)) {
+  console.error(`Session inbound DB not found: ${dbPath}`);
+  process.exit(1);
+}
 
-const max = (db.prepare('SELECT MAX(seq) AS m FROM messages_in').get() as { m: number | null }).m ?? 0;
-const seq = max % 2 === 0 ? max + 2 : max + 1; // next EVEN seq (host parity)
-const id = `notify-${Date.now()}:${AGENT_GROUP}`;
-const content = JSON.stringify({ text, sender: 'system', senderId: 'system' });
+const id = `notify-${Date.now()}:${target.agent_group_id}`;
+const db = openInboundDb(dbPath);
+try {
+  insertMessage(db, {
+    id,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: target.platform_id,
+    channelType: target.channel_type,
+    threadId: target.thread_id,
+    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+    processAfter: null,
+    recurrence: null,
+    trigger: true,
+  });
+} finally {
+  db.close();
+}
 
-db.prepare(
-  `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, on_wake)
-   VALUES (@id, @seq, 'chat', @ts, 'pending', @platformId, @channel, NULL, @content, NULL, NULL, @id, 1, NULL, 0)`,
-).run({
-  id,
-  seq,
-  ts: new Date().toISOString(),
-  platformId: PLATFORM_ID,
-  channel: CHANNEL,
-  content,
-});
-
-console.log(`Injected ${id} (seq ${seq})`);
-db.close();
+console.log(`Injected ${id} → session ${target.session_id} (${target.channel_type ?? 'agent'} ${target.platform_id ?? ''})`);
