@@ -3,8 +3,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
 import { formatMessages, extractRouting } from './formatter.js';
-import { processQuery } from './poll-loop.js';
+import { formatMessagesWithCommands, processQuery, pushFollowUp } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -277,6 +281,94 @@ describe('origin metadata (from= attribute)', () => {
     const prompt = formatMessages(getPendingMessages());
     expect(prompt).toContain('<system_response');
     expect(prompt).toContain('from="discord-main"');
+  });
+});
+
+describe('formatMessagesWithCommands image handling', () => {
+  const PNG_1X1 = Buffer.from(
+    '89504E470D0A1A0A0000000D49484452000000010000000108060000001F15C4890000000D' +
+      '49444154789C6300010000000500010D0A2DB40000000049454E44AE426082',
+    'hex',
+  );
+  let tmpRoot: string;
+  const originalRoot = process.env.WORKSPACE_ROOT;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'poll-images-'));
+    fs.mkdirSync(path.join(tmpRoot, 'inbox'), { recursive: true });
+    process.env.WORKSPACE_ROOT = tmpRoot;
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    if (originalRoot === undefined) delete process.env.WORKSPACE_ROOT;
+    else process.env.WORKSPACE_ROOT = originalRoot;
+  });
+
+  it('returns a plain-string prompt and no images for a text-only batch', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'hello' });
+    const out = formatMessagesWithCommands(getPendingMessages(), true);
+    expect(typeof out.text).toBe('string');
+    expect(out.images).toEqual([]);
+  });
+
+  it('carries images out-of-band with numbering continuous across a passthrough command flush', () => {
+    fs.writeFileSync(path.join(tmpRoot, 'inbox', 'a.png'), PNG_1X1);
+    fs.writeFileSync(path.join(tmpRoot, 'inbox', 'b.png'), PNG_1X1);
+    insertMessage('m1', 'chat-sdk', {
+      sender: 'Alice',
+      text: 'first',
+      attachments: [{ type: 'image', name: 'a.png', localPath: 'inbox/a.png' }],
+    });
+    insertMessage('m2', 'chat-sdk', { sender: 'Alice', text: '/cost' });
+    insertMessage('m3', 'chat-sdk', {
+      sender: 'Alice',
+      text: 'second',
+      attachments: [{ type: 'image', name: 'b.png', localPath: 'inbox/b.png' }],
+    });
+
+    const out = formatMessagesWithCommands(getPendingMessages(), true);
+
+    // Prompt is text only — no base64 inside it.
+    expect(out.text).not.toContain(PNG_1X1.toString('base64'));
+    expect(out.text).toContain('[image 1: a.png]');
+    expect(out.text).toContain('\n\n/cost\n\n');
+    expect(out.text).toContain('[image 2: b.png]');
+    expect(out.images).toHaveLength(2);
+    expect(out.images.every((i) => i.mediaType === 'image/png' && i.bytes === PNG_1X1.length)).toBe(true);
+  });
+});
+
+describe('pushFollowUp', () => {
+  const image = { mediaType: 'image/png' as const, data: 'AA==', bytes: 1 };
+  function fakeQuery(withImages: boolean) {
+    const calls: { method: string; args: unknown[] }[] = [];
+    const q: AgentQuery = {
+      push: (m: string) => void calls.push({ method: 'push', args: [m] }),
+      ...(withImages ? { pushImages: (m: string, i: unknown) => void calls.push({ method: 'pushImages', args: [m, i] }) } : {}),
+      end: () => {},
+      abort: () => {},
+      events: (async function* () {})(),
+    };
+    return { q, calls };
+  }
+
+  it('uses pushImages when the provider offers it and images are present', () => {
+    const { q, calls } = fakeQuery(true);
+    pushFollowUp(q, 'see [image 1: a.png]', [image]);
+    expect(calls).toEqual([{ method: 'pushImages', args: ['see [image 1: a.png]', [image]] }]);
+  });
+
+  it('pushes the plain string when there are no images', () => {
+    const { q, calls } = fakeQuery(true);
+    pushFollowUp(q, 'text only', []);
+    expect(calls).toEqual([{ method: 'push', args: ['text only'] }]);
+  });
+
+  it('falls back to push(text) for providers without pushImages', () => {
+    const { q, calls } = fakeQuery(false);
+    pushFollowUp(q, 'see [image 1: a.png]', [image]);
+    expect(calls).toEqual([{ method: 'push', args: ['see [image 1: a.png]'] }]);
   });
 });
 

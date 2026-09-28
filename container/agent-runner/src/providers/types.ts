@@ -1,3 +1,4 @@
+import type { ImageContent } from '../attachments.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 
 export interface AgentProvider {
@@ -100,42 +101,20 @@ export interface ProviderOptions {
   fastMode?: boolean;
 }
 
-/**
- * Content block for multipart user messages. Mirrors the Anthropic
- * Messages API shape so providers built on the Claude Agent SDK can pass
- * blocks through with no translation. Other providers may downcast to
- * the text portion only — see promptToText().
- */
-export type ContentBlock =
-  | { type: 'text'; text: string }
-  | {
-      type: 'image';
-      source: {
-        type: 'base64';
-        media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
-        data: string;
-      };
-    };
-
-/**
- * Reduce a possibly-multipart prompt to plain text. Used by providers that
- * don't support image blocks (mock, future text-only backends) and by log
- * lines that don't want to spew base64 payloads.
- */
-export function promptToText(prompt: string | ContentBlock[]): string {
-  if (typeof prompt === 'string') return prompt;
-  return prompt
-    .map((b) => (b.type === 'text' ? b.text : `[image:${b.source.media_type}]`))
-    .join('\n');
-}
-
 export interface QueryInput {
+  /** Initial prompt (already formatted by agent-runner into a string). */
+  prompt: string;
+
   /**
-   * Initial prompt (already formatted by agent-runner). String for
-   * text-only turns; an array of content blocks when the batch includes
-   * image attachments.
+   * Image attachments from the same batch, carried out-of-band so `prompt`
+   * stays a plain string for every provider. The prompt text holds a
+   * numbered `[image N: name]` placeholder per entry, in array order.
+   * Providers with native image input (Claude) build their own content
+   * blocks from these; text-only providers may ignore the field (the file
+   * stays on disk under /workspace, but the numbered placeholder does not
+   * name its path).
    */
-  prompt: string | ContentBlock[];
+  images?: ImageContent[];
 
   /**
    * Opaque continuation token from a previous query. The provider decides
@@ -180,7 +159,15 @@ export type McpServerConfig =
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */
-  push(message: string | ContentBlock[]): void;
+  push(message: string): void;
+
+  /**
+   * Optional: push a follow-up whose batch carried image attachments, same
+   * out-of-band contract as `QueryInput.images`. Providers with native image
+   * input implement it; when absent the poll-loop pushes the text alone
+   * (`push`), and the batch's images are not forwarded.
+   */
+  pushImages?(message: string, images: ImageContent[]): void;
 
   /** Signal that no more input will be sent. */
   end(): void;

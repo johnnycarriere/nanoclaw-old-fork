@@ -4,6 +4,7 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+import type { ImageContent } from '../attachments.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
@@ -12,7 +13,6 @@ import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
   AgentQuery,
-  ContentBlock,
   McpServerConfig,
   ProviderEvent,
   ProviderOptions,
@@ -134,6 +134,33 @@ function mcpAllowPattern(serverName: string): string {
   return `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__*`;
 }
 
+/**
+ * Anthropic Messages API content block for a multipart user turn. The SDK
+ * forwards the array to the API verbatim, so it mirrors the wire shape.
+ */
+export type ContentBlock =
+  | { type: 'text'; text: string }
+  | {
+      type: 'image';
+      source: { type: 'base64'; media_type: ImageContent['mediaType']; data: string };
+    };
+
+/**
+ * Build the SDK user-message content: the plain prompt string when the
+ * batch carried no images (cheaper to log, trace and archive), otherwise
+ * the text block first — so the model has the chat context, including the
+ * numbered `[image N: name]` placeholders — followed by one image block per
+ * entry in `images` order.
+ */
+export function toSdkContent(prompt: string, images?: ImageContent[]): string | ContentBlock[] {
+  if (!images || images.length === 0) return prompt;
+  const blocks: ContentBlock[] = [{ type: 'text', text: prompt }];
+  for (const img of images) {
+    blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } });
+  }
+  return blocks;
+}
+
 interface SDKUserMessage {
   type: 'user';
   message: { role: 'user'; content: string | ContentBlock[] };
@@ -143,20 +170,18 @@ interface SDKUserMessage {
 
 /**
  * Push-based async iterable for streaming user messages to the Claude SDK.
- *
- * `content` accepts either a plain string (text-only turns) or an array
- * of Anthropic content blocks (text + image, for multimodal input). The
- * SDK forwards both shapes to the Messages API verbatim.
+ * Text-only turns go through as a plain string; turns with image
+ * attachments become a content-block array (see toSdkContent).
  */
 class MessageStream {
   private queue: SDKUserMessage[] = [];
   private waiting: (() => void) | null = null;
   private done = false;
 
-  push(content: string | ContentBlock[]): void {
+  push(message: string, images?: ImageContent[]): void {
     this.queue.push({
       type: 'user',
-      message: { role: 'user', content },
+      message: { role: 'user', content: toSdkContent(message, images) },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -346,6 +371,38 @@ function transcriptRotateBytes(): number {
 }
 
 /**
+ * Image-inclusive ceiling. Inlined image attachments (and images the agent
+ * Read) sit in the transcript as base64 blobs that are byte-heavy but cheap
+ * to reload and to tokenize, so they are excluded from the primary size cap
+ * (`transcriptRotateBytes`) and bounded separately by this larger cap. Keeps
+ * a couple of photo batches from rotating an otherwise short session.
+ * Operator-overridable.
+ */
+function transcriptRotateImageBytes(): number {
+  return Number(process.env.CLAUDE_TRANSCRIPT_ROTATE_IMAGE_BYTES) || 64 * 1024 * 1024;
+}
+
+/**
+ * Bytes of base64 image payload in a transcript: the `"data":"…"` values of
+ * base64-source image blocks. Only long runs count — short `data` fields
+ * (tool params, etc.) are text for this purpose. Returns 0 when the file
+ * can't be read; the caller then treats every byte as text.
+ */
+const IMAGE_DATA_RE = /"data":"([A-Za-z0-9+/=]{4096,})"/g;
+
+export function transcriptImageBytes(transcriptPath: string): number {
+  let content: string;
+  try {
+    content = fs.readFileSync(transcriptPath, 'utf8');
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const m of content.matchAll(IMAGE_DATA_RE)) total += m[1].length;
+  return total;
+}
+
+/**
  * Secondary age trigger, measured from the transcript's first entry. 0 (or a
  * non-positive value) disables the age check; size alone then governs.
  */
@@ -530,13 +587,20 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     const maxBytes = transcriptRotateBytes();
+    const maxImageBytes = transcriptRotateImageBytes();
+    // Only scan for image payload when the raw size is over the text cap —
+    // the common case stays a single stat().
+    const imageBytes = size > maxBytes ? transcriptImageBytes(transcriptPath) : 0;
+    const textBytes = size - imageBytes;
     const startMs = transcriptStartMs(transcriptPath);
     const ageMs = startMs === null ? 0 : Date.now() - startMs;
     const maxAgeMs = transcriptRotateAgeMs();
 
     let reason: string | null = null;
-    if (size > maxBytes) {
-      reason = `transcript ${(size / 1_048_576).toFixed(1)}MB > ${(maxBytes / 1_048_576).toFixed(0)}MB cap`;
+    if (textBytes > maxBytes) {
+      reason = `transcript ${(textBytes / 1_048_576).toFixed(1)}MB (excl. ${(imageBytes / 1_048_576).toFixed(1)}MB images) > ${(maxBytes / 1_048_576).toFixed(0)}MB cap`;
+    } else if (size > maxImageBytes) {
+      reason = `transcript ${(size / 1_048_576).toFixed(1)}MB incl. images > ${(maxImageBytes / 1_048_576).toFixed(0)}MB cap`;
     } else if (startMs !== null && ageMs > maxAgeMs) {
       reason = `transcript ${(ageMs / 86_400_000).toFixed(1)}d old > ${(maxAgeMs / 86_400_000).toFixed(0)}d cap`;
     }
@@ -556,7 +620,7 @@ export class ClaudeProvider implements AgentProvider {
   query(input: QueryInput): AgentQuery {
     if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
     const stream = new MessageStream();
-    stream.push(input.prompt);
+    stream.push(input.prompt, input.images);
 
     const instructions = input.systemContext?.instructions;
 
@@ -689,6 +753,7 @@ export class ClaudeProvider implements AgentProvider {
 
     return {
       push: (msg) => stream.push(msg),
+      pushImages: (msg, images) => stream.push(msg, images),
       end: () => stream.end(),
       events: translateEvents(),
       abort: () => {

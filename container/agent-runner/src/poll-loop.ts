@@ -29,19 +29,36 @@ import {
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
-import type {
-  AgentProvider,
-  AgentQuery,
-  ContentBlock,
-  ProviderEvent,
-  ProviderExchange,
-} from './providers/types.js';
+import type { ImageContent } from './attachments.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
 
 /** Consecutive driver-classified failures before a fresh runner is required. */
 const MAILBOX_FAILURE_STREAK_EXIT = 10;
+
+// Transient API/proxy failure signatures from the Claude Agent SDK / OneCLI
+// gateway (upstream connection reset, MITM handshake failure, ...). The runner
+// stamps a structural marker on the error row it writes so the host's
+// transient-retry re-queues the whole batch without inspecting chat text.
+const TRANSIENT_ERROR_PATTERNS = [
+  'ECONNRESET',
+  'Unable to connect to API',
+  'connection error',
+  'serving MITM connection',
+  'fetch failed',
+  'ETIMEDOUT',
+];
+
+/** Marker fields merged into an error row's content when the error is transient. */
+export function transientErrorMarker(
+  text: string,
+  batchIds: string[],
+): { transient: true; batch_ids: string[] } | undefined {
+  if (!TRANSIENT_ERROR_PATTERNS.some((p) => text.includes(p))) return undefined;
+  return { transient: true, batch_ids: batchIds };
+}
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -224,7 +241,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const formatted = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
-    const prompt = toProviderPrompt(formatted);
 
     log(
       `Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}` +
@@ -232,7 +248,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     );
 
     const query = config.provider.query({
-      prompt,
+      prompt: formatted.text,
+      images: formatted.images.length > 0 ? formatted.images : undefined,
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
@@ -284,14 +301,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
+      // Write error response so the user knows something went wrong. A
+      // transient failure carries a marker + the batch ids so the host can
+      // re-queue the batch (see src/transient-retry.ts).
       await writeMessageOut({
         id: generateId(),
+        in_reply_to: routing.inReplyTo,
         kind: 'chat',
         platform_id: routing.platformId,
         channel_type: routing.channelType,
         thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        content: JSON.stringify({ text: `Error: ${errMsg}`, ...transientErrorMarker(errMsg, processingIds) }),
       });
 
       // The batch is still acked completed below (no redelivery). Without
@@ -316,23 +336,24 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
  *
- * Returns text + extracted image attachments. Images sit alongside the
- * text rather than inside it because the SDK needs them as structured
- * `image` content blocks — see toProviderPrompt().
+ * Returns text + extracted image attachments. Images ride out-of-band
+ * (`QueryInput.images`) rather than inside the text: the prompt stays a
+ * plain string for every provider, and Claude builds its own `image`
+ * content blocks from the array. One shared sink across every flushed
+ * sub-batch keeps the per-prompt image budget and the `[image N: name]`
+ * numbering continuous.
  */
-function formatMessagesWithCommands(
+export function formatMessagesWithCommands(
   messages: MessageInRow[],
   nativeSlashCommands: boolean,
-): { text: string; images: { mediaType: string; data: string }[] } {
+): { text: string; images: ImageContent[] } {
   const parts: string[] = [];
-  const images: { mediaType: string; data: string }[] = [];
+  const images: ImageContent[] = [];
   const normalBatch: MessageInRow[] = [];
 
   const flushNormal = () => {
     if (normalBatch.length === 0) return;
-    const out = formatMessagesForPrompt(normalBatch);
-    parts.push(out.text);
-    images.push(...out.images);
+    parts.push(formatMessagesForPrompt(normalBatch, images).text);
     normalBatch.length = 0;
   };
 
@@ -355,25 +376,17 @@ function formatMessagesWithCommands(
 }
 
 /**
- * Build the provider prompt. Plain string when there are no images
- * (cheaper to log and trace); a content-block array when one or more
- * images need to ride alongside the text. Ordering puts text first so
- * the model has the surrounding chat context before any image.
+ * Push a follow-up into the active query, carrying its images out-of-band
+ * through `pushImages` when the provider offers it. Providers without native
+ * image input only implement `push`; the text (with its `[image N: name]`
+ * placeholders) still goes through and the image payloads are dropped.
  */
-function toProviderPrompt(formatted: { text: string; images: { mediaType: string; data: string }[] }): string | ContentBlock[] {
-  if (formatted.images.length === 0) return formatted.text;
-  const blocks: ContentBlock[] = [{ type: 'text', text: formatted.text }];
-  for (const img of formatted.images) {
-    blocks.push({
-      type: 'image',
-      source: {
-        type: 'base64',
-        media_type: img.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-        data: img.data,
-      },
-    });
+export function pushFollowUp(query: AgentQuery, text: string, images: ImageContent[]): void {
+  if (images.length > 0 && query.pushImages) {
+    query.pushImages(text, images);
+    return;
   }
-  return blocks;
+  query.push(text);
 }
 
 interface QueryResult {
@@ -542,7 +555,7 @@ export async function processQuery(
         );
         unwrappedNudged = false;
         taskBlockNudged = false;
-        query.push(toProviderPrompt(formattedFollow));
+        pushFollowUp(query, formattedFollow.text, formattedFollow.images);
         archivePrompts.push(formattedFollow.text);
         markCompleted(keptIds);
       } catch (err) {
@@ -640,7 +653,7 @@ export async function processQuery(
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
             // the failing gateway turn after turn.
-            await deliverErrorResult(event.text, routing);
+            await deliverErrorResult(event.text, routing, initialBatchIds);
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
@@ -755,7 +768,7 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * This is the same user-facing write the outer catch block does, minus the
  * `Error:` prefix — the provider's text is already a user-facing message.
  */
-async function deliverErrorResult(text: string, routing: RoutingContext): Promise<void> {
+async function deliverErrorResult(text: string, routing: RoutingContext, batchIds: string[]): Promise<void> {
   log('Error result with no <message> envelope — delivering to channel');
   await writeMessageOut({
     id: generateId(),
@@ -764,7 +777,7 @@ async function deliverErrorResult(text: string, routing: RoutingContext): Promis
     platform_id: routing.platformId,
     channel_type: routing.channelType,
     thread_id: routing.threadId,
-    content: JSON.stringify({ text: stripHarnessTagArtifacts(text) }),
+    content: JSON.stringify({ text: stripHarnessTagArtifacts(text), ...transientErrorMarker(text, batchIds) }),
   });
 }
 

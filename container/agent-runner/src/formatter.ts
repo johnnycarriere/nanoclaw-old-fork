@@ -1,4 +1,4 @@
-import { loadImageAttachment, type ImageContent } from './attachments.js';
+import { fitsImageBudget, loadImageAttachment, type ImageContent } from './attachments.js';
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { TIMEZONE, formatLocalTime, formatLocalStamp } from './timezone.js';
@@ -156,11 +156,15 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
  * Strips routing fields — the agent never sees platform_id, channel_type, thread_id.
  *
  * If `imagesSink` is provided, image attachments with a resolvable, in-budget
- * file are loaded as base64 and pushed onto it; their text marker is omitted
- * (a brief `[image: name]` placeholder is left so the model can correlate
- * each rendered image with its message). Without the sink, attachments fall
- * back to the legacy path-marker text — unchanged behavior for callers that
- * can't carry image content blocks (e.g. unit tests, pure-string consumers).
+ * file are loaded as base64 and pushed onto it; their text marker is replaced
+ * by a numbered `[image N: name]` placeholder (N = 1-based position on the
+ * sink) so the model can correlate each rendered image with its message even
+ * though providers append the image blocks after the text. The sink is the
+ * per-prompt budget scope (MAX_IMAGES_PER_PROMPT / MAX_IMAGE_BYTES_PER_PROMPT
+ * in attachments.ts): once it is full, later images fall back to the path
+ * marker. Without the sink, attachments always render the legacy path-marker
+ * text — unchanged behavior for callers that can't carry image content
+ * blocks (e.g. unit tests, pure-string consumers).
  */
 export function formatMessages(messages: MessageInRow[], imagesSink?: ImageContent[]): string {
   const header = `<context timezone="${escapeXml(TIMEZONE)}" />\n`;
@@ -194,9 +198,14 @@ export function formatMessages(messages: MessageInRow[], imagesSink?: ImageConte
  * Convenience wrapper that returns text + extracted image content blocks
  * together. Use this on the prompt path so the agent gets actual rendered
  * images instead of a path marker pointing at a binary file it can't see.
+ *
+ * Pass an existing `images` array to share one budget (and one numbering
+ * sequence) across several calls that build a single prompt.
  */
-export function formatMessagesForPrompt(messages: MessageInRow[]): { text: string; images: ImageContent[] } {
-  const images: ImageContent[] = [];
+export function formatMessagesForPrompt(
+  messages: MessageInRow[],
+  images: ImageContent[] = [],
+): { text: string; images: ImageContent[] } {
   const text = formatMessages(messages, images);
   return { text, images };
 }
@@ -381,15 +390,16 @@ function formatAttachments(attachments: any[] | undefined, imagesSink?: ImageCon
 
     // Image inlining: when the caller can carry image content blocks, try
     // to load the file as base64 and push it onto the sink. On success,
-    // leave a brief placeholder so the model can correlate the rendered
-    // image with the surrounding message context. On failure (missing
-    // file, oversized, unrecognized format) fall through to the legacy
-    // path-marker so nothing silently disappears.
+    // leave a numbered placeholder so the model can correlate the rendered
+    // image (appended after the text, in sink order) with the surrounding
+    // message context. On failure (missing file, oversized, unrecognized
+    // format) or when the per-prompt budget is spent, fall through to the
+    // legacy path-marker so nothing silently disappears.
     if (imagesSink && type === 'image' && localPath) {
       const img = loadImageAttachment(localPath);
-      if (img) {
+      if (img && fitsImageBudget(imagesSink, img.bytes)) {
         imagesSink.push(img);
-        return `[image: ${escapeXml(name)}]`;
+        return `[image ${imagesSink.length}: ${escapeXml(name)}]`;
       }
     }
 

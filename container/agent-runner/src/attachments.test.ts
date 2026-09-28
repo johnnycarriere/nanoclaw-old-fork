@@ -3,7 +3,14 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { loadImageAttachment } from './attachments.js';
+import {
+  MAX_IMAGES_PER_PROMPT,
+  MAX_IMAGE_BYTES_PER_PROMPT,
+  MAX_RAW_IMAGE_BYTES,
+  fitsImageBudget,
+  loadImageAttachment,
+  type ImageContent,
+} from './attachments.js';
 
 // 1x1 PNG (transparent) — minimal valid file
 const PNG_1X1 = Buffer.from(
@@ -37,6 +44,7 @@ describe('loadImageAttachment', () => {
     expect(result).not.toBeNull();
     expect(result!.mediaType).toBe('image/png');
     expect(result!.data).toBe(PNG_1X1.toString('base64'));
+    expect(result!.bytes).toBe(PNG_1X1.length);
   });
 
   it('detects JPEG by magic bytes regardless of extension', () => {
@@ -55,8 +63,8 @@ describe('loadImageAttachment', () => {
   });
 
   it('returns null when the file exceeds the size cap', () => {
-    // 4MB > MAX_RAW_IMAGE_BYTES (3.9MB) — synthesize a "PNG" past the cap
-    const oversized = Buffer.concat([PNG_1X1, Buffer.alloc(4_000_000)]);
+    // Synthesize a "PNG" just past the per-image raw cap (3.5MB)
+    const oversized = Buffer.concat([PNG_1X1, Buffer.alloc(MAX_RAW_IMAGE_BYTES)]);
     fs.writeFileSync(path.join(tmpRoot, 'inbox', 'big.png'), oversized);
     expect(loadImageAttachment('inbox/big.png')).toBeNull();
   });
@@ -68,5 +76,21 @@ describe('loadImageAttachment', () => {
     } finally {
       fs.unlinkSync(path.join(os.tmpdir(), 'outside.png'));
     }
+  });
+});
+
+describe('fitsImageBudget', () => {
+  const img = (bytes: number): ImageContent => ({ mediaType: 'image/png', data: 'AA==', bytes });
+
+  it('accepts the first image and rejects past the count cap', () => {
+    expect(fitsImageBudget([], 100)).toBe(true);
+    const full = Array.from({ length: MAX_IMAGES_PER_PROMPT }, () => img(1));
+    expect(fitsImageBudget(full, 1)).toBe(false);
+  });
+
+  it('rejects an image that would push raw bytes over the per-prompt cap', () => {
+    const nearlyFull = [img(MAX_IMAGE_BYTES_PER_PROMPT - 10)];
+    expect(fitsImageBudget(nearlyFull, 10)).toBe(true);
+    expect(fitsImageBudget(nearlyFull, 11)).toBe(false);
   });
 });
