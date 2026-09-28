@@ -115,6 +115,25 @@ export async function findTaskSessions(agentGroupId: string, includeClosed = fal
   );
 }
 
+/**
+ * Sessions that may hold v1-migrated task rows. Before per-series task sessions
+ * existed, recurring tasks were stored in a group's main-chat mailbox, which
+ * carries thread_id = NULL (and a non-null messaging_group_id). findTaskSessions
+ * cannot see those (it requires a system:tasks* thread), so the CLI unions these
+ * in to keep legacy tasks listable/manageable. Chat sessions with no task rows
+ * contribute nothing to the task fan-out.
+ */
+export async function findLegacyTaskSessions(agentGroupId: string, includeClosed = false): Promise<Session[]> {
+  return getDb().all<Session>(
+    `SELECT * FROM sessions
+      WHERE agent_group_id = ?
+        AND thread_id IS NULL
+        ${includeClosed ? '' : "AND status = 'active'"}
+      ORDER BY created_at DESC`,
+    agentGroupId,
+  );
+}
+
 export async function getActiveSessions(): Promise<Session[]> {
   return getDb().all<Session>("SELECT * FROM sessions WHERE status = 'active'");
 }

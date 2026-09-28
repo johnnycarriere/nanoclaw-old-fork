@@ -5,6 +5,7 @@ import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
   deleteSession,
+  findLegacyTaskSessions,
   findTaskSessions,
   getActiveSessions,
   getSession,
@@ -91,11 +92,18 @@ async function selectedSessions(
 
   const group = groupArg(args, ctx);
   if (group) {
-    // One session per live task series — the loops below already fan out across them.
-    return (await findTaskSessions(group, includeClosed)).map((s) => ({
-      id: s.id,
-      agent_group_id: s.agent_group_id,
-    }));
+    // Per-series task sessions, plus legacy v1-migrated sessions (recurring tasks
+    // left in the main-chat mailbox, thread_id NULL) so those stay listable and
+    // manageable. The loops below fan out across them; chat sessions with no task
+    // rows are inert. Dedupe by id in case a session matches both queries.
+    const found = [
+      ...(await findTaskSessions(group, includeClosed)),
+      ...(await findLegacyTaskSessions(group, includeClosed)),
+    ];
+    const seen = new Set<string>();
+    return found
+      .filter((s) => (seen.has(s.id) ? false : (seen.add(s.id), true)))
+      .map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
   }
 
   if (ctx.caller === 'agent') return [];
