@@ -34,13 +34,7 @@ export function openOutboundDb(dbPath: string): Database.Database {
   return db;
 }
 
-/**
- * Open the outbound DB read-write for a sanctioned host-write. The container
- * owns this DB; only narrow paths write here (transient-retry's processing_ack
- * clear, command-gate's writeOutboundDirect, host-sweep). Callers must open-
- * write-CLOSE per op to honor the cross-mount invariant; otherwise only safe
- * to call when no container is running.
- */
+/** Open the outbound DB for a session with write access. Only safe to call when no container is running. */
 export function openOutboundDbRw(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma('journal_mode = DELETE');

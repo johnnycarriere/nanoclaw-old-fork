@@ -43,7 +43,7 @@ import { DATA_DIR, GROUPS_DIR } from '../config.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from '../egress-lockdown.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
-import { ONECLI_DOCKER_NETWORK, onecliDockerNetworkAvailable } from '../onecli-network.js';
+import { onecliNetworkJoin } from '../onecli-network.js';
 
 import { DockerSessionDriver, agentContainerName } from './docker-driver.js';
 import {
@@ -85,7 +85,8 @@ function dockerNetworkArgs(spec: SessionSpec): string[] {
   const args = ['--add-host=host.docker.internal:host-gateway'];
   // FORK: OneCLI runs in Docker on Linux; join its compose network so the
   // gateway proxy is reachable in-docker (see src/onecli-network.ts).
-  if (onecliDockerNetworkAvailable()) args.push('--network', ONECLI_DOCKER_NETWORK);
+  const onecli = onecliNetworkJoin();
+  if (onecli.join) args.push('--network', onecli.network);
   return args;
 }
 

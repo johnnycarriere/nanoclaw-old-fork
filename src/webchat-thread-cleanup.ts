@@ -36,11 +36,13 @@ export async function cleanupAgentSessionsForThread(messagingGroupId: string, th
       });
       continue;
     }
+    // Drop the session row first so nothing can resolve (and wake) this
+    // session between the row delete and the directory removal.
+    await deleteSession(session.id);
     const dir = sessionDir(session.agent_group_id, session.id);
     if (fs.existsSync(dir)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-    await deleteSession(session.id);
     log.info('Deleted agent session for web thread', {
       sessionId: session.id,
       agentGroupId: session.agent_group_id,

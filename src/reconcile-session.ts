@@ -36,6 +36,7 @@ import type Database from 'better-sqlite3';
 import { getSessionClaim } from './db/coordination.js';
 import { getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import { log } from './log.js';
 import { heartbeatPath, withExistingMailboxSession } from './session-manager.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
@@ -191,9 +192,14 @@ async function runForkSessionHooks(agentGroupId: string, session: Session): Prom
     inDb = openInboundDb(inPath);
     outDb = openOutboundDb(outPath);
     const { emitStatusReactions } = await import('./status-reactions.js');
-    await emitStatusReactions(inDb, outDb);
+    const messagingGroup = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+    await emitStatusReactions(inDb, outDb, {
+      sessionId: session.id,
+      agentGroupId,
+      instance: messagingGroup?.instance ?? null,
+    });
     const { detectAndRetryTransient } = await import('./transient-retry.js');
-    detectAndRetryTransient(inDb, outDb, outPath);
+    detectAndRetryTransient(inDb, outDb);
   } catch (err) {
     log.error('Fork session hooks failed', { sessionId: session.id, err });
   } finally {
